@@ -18,7 +18,6 @@ import logging
 from datetime import datetime
 
 
-# 初始化日志系统
 def init_logger(log_dir="logs", prefix="experiment_clean"):
     os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -72,12 +71,7 @@ torch.manual_seed(args.seed)
 torch.cuda.manual_seed(args.seed)
 print(args)
 log_file = init_logger()
-logging.info("=== 实验开始 ===")
-logging.info(f"实验参数: {vars(args)}")
 
-# --------------------------
-# 1. 加载并准备数据集
-# --------------------------
 transform = T.Compose([T.NormalizeFeatures()])
 if args.dataset in ['Cora', 'Citeseer', 'PubMed']:
     dataset = Planetoid(root='./data/Planetoid', name=args.dataset, transform=transform)
@@ -97,7 +91,6 @@ train_idx = all_idx[:n_train]
 val_idx = all_idx[n_train:n_train + n_val]
 test_idx = all_idx[n_train + n_val:]
 
-# 构造 GNN
 if args.model == 'GCN':
     legalGNN = GCN(input_dim=data.x.size(1), hid_dim=args.hidden, num_layer=args.num_layer, drop_ratio=args.dropout).to(
         device)
@@ -111,7 +104,6 @@ elif args.model == 'GIN':
     legalGNN = GIN(input_dim=data.x.size(1), hid_dim=args.hidden, num_layer=args.num_layer, drop_ratio=args.dropout).to(
         device)
 
-# 构造 Prompt 和分类器
 prompt = MyPrompt(args.hidden).to(device)
 legalCls = NodeClassifier(hid_dim=args.hidden, num_classes=num_classes, dropout=args.dropout, inner_dim=args.hidden).to(
     device)
@@ -120,9 +112,7 @@ legalGNN_optimizer = torch.optim.Adam(legalGNN.parameters(), lr=args.train_lr, w
 prompt_optimizer = torch.optim.Adam(prompt.parameters(), lr=args.train_lr, weight_decay=args.weight_decay)
 legalCls_optimizer = torch.optim.Adam(legalCls.parameters(), lr=args.train_lr, weight_decay=args.weight_decay)
 
-print("\n[开始训练 GNN + Classifier]")
 
-# 第一阶段
 for epoch in range(1, args.epochs + 1):
     legalGNN.train()
     legalCls.train()
@@ -145,13 +135,11 @@ for epoch in range(1, args.epochs + 1):
         acc_test = (pred[test_idx] == data.y[test_idx]).float().mean().item()
     print(f"[Stage1] Epoch {epoch:03d} | Loss: {loss.item():.4f} | Val Acc: {acc_val:.4f} | Test Acc: {acc_test:.4f}")
 
-# 冻结 GNN 和 Classifier
 for p in legalGNN.parameters():
     p.requires_grad = False
 for p in legalCls.parameters():
     p.requires_grad = False
 
-print("\n[开始仅训练 Prompt]")
 test_acc_list = []
 
 for epoch in range(1, args.epochs + 1):
@@ -176,7 +164,4 @@ for epoch in range(1, args.epochs + 1):
     print(
         f"[Stage2] Epoch {epoch:03d} | Prompt Loss: {loss.item():.4f} | Val Acc: {acc_val:.4f} | Test Acc: {acc_test:.4f}")
 
-# 平均测试准确率
-avg_test_acc = sum(test_acc_list) / len(test_acc_list)
-print(f"\n[Stage2] 平均测试准确率: {avg_test_acc:.4f}")
-logging.info(f"[Stage2] 平均测试准确率: {avg_test_acc:.4f}")
+

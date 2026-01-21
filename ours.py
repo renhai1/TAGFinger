@@ -23,7 +23,6 @@ import logging
 from datetime import datetime
 
 
-# 初始化日志系统
 def init_logger(log_dir="logs", prefix="experiment"):
     os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -102,12 +101,8 @@ torch.manual_seed(args.seed)
 torch.cuda.manual_seed(args.seed)
 print(args)
 log_file = init_logger()
-logging.info("=== 实验开始 ===")
-logging.info(f"实验参数: {vars(args)}")
 
-# --------------------------
-# 1. 加载并准备数据集
-# --------------------------
+
 transform = T.Compose([T.NormalizeFeatures()])
 if (args.dataset == 'Cora' or args.dataset == 'Citeseer' or args.dataset == 'PubMed'):
     dataset = Planetoid(root='./data/Planetoid',
@@ -120,7 +115,6 @@ data = dataset[0]
 data = data.to(device)
 
 
-# 2、筛选模型不易分类正确的节点
 def find_consistently_misclassified_nodes(data, num_classes, train_idx, test_idx):
     misclass_record = defaultdict(lambda: [0] * data.num_nodes)
     acc_list = []
@@ -156,12 +150,10 @@ def find_consistently_misclassified_nodes(data, num_classes, train_idx, test_idx
                 if preds[i] != data.y[i]:
                     misclass_record[trial][i] = 1
 
-    print(f"[筛选阶段] 平均准确率: {np.mean(acc_list):.4f}\n")
 
     total_errors = np.sum([misclass_record[t] for t in range(args.n_trials)], axis=0)
     always_wrong = np.where(total_errors == args.n_trials)[0]
 
-    # === 平均分配总节点数 ===
     base = args.total_select // num_classes
     remainder = args.total_select % num_classes
     per_class_allocation = [base + (1 if i < remainder else 0) for i in range(num_classes)]
@@ -175,14 +167,12 @@ def find_consistently_misclassified_nodes(data, num_classes, train_idx, test_idx
             selected = candidates
         selected_nodes_per_class[c] = selected
 
-    # === 保存索引 ===
     save_path = './saved_indices/'
     if not os.path.exists(save_path):
         os.makedirs(save_path)
     save_file = os.path.join(save_path, f'{args.dataset}_{args.n_trials}_{args.total_select}_selected_nodes.pkl')
     with open(save_file, 'wb') as f:
         pickle.dump(selected_nodes_per_class, f)
-    print(f"[保存] 筛选结果已保存至: {save_file}")
     return selected_nodes_per_class
 
 def load_selected_nodes(save_path='./saved_indices/'):
@@ -190,16 +180,12 @@ def load_selected_nodes(save_path='./saved_indices/'):
     if os.path.exists(file_path):
         with open(file_path, 'rb') as f:
             selected_nodes_per_class = pickle.load(f)
-        print(f"[加载] 成功加载已筛选节点索引: {file_path}")
         return selected_nodes_per_class
     else:
-        print(f"[警告] 未找到保存的节点索引文件: {file_path}")
         return None
 
 
-# --------------------------
-# 4. 触发器注入函数
-# --------------------------
+
 def inject_trigger_and_optimize(data, target_nodes):
     from scipy.stats import wasserstein_distance
     orig_x = data.x.clone().detach()
@@ -252,7 +238,6 @@ def inject_trigger_and_optimize(data, target_nodes):
     return Data(x=new_x, edge_index=new_edge_index, y=new_y)
 
 
-# 筛选节点
 train_idx = data.train_mask.nonzero(as_tuple=False).view(-1)
 test_idx = data.test_mask.nonzero(as_tuple=False).view(-1)
 num_classes = dataset.num_classes
@@ -270,36 +255,30 @@ print(selected_all_nodes)
 
 new_data = inject_trigger_and_optimize(data=data, target_nodes=selected_all_nodes)
 
-# --------------------------
-# 6. 训练合法模型（GNN + Prompt）
-# --------------------------
 
-# 获取所有触发器节点的索引（新图中原始节点之后的新增节点）
 trigger_nodes = torch.arange(data.num_nodes, new_data.num_nodes, device=device)
 
-# 获取新图中所有节点的索引
+
 all_idx = torch.arange(new_data.num_nodes, device=device)
 
-# 构建掩码：标记出非触发器节点的位置
+
 non_trigger_mask = ~torch.isin(all_idx, trigger_nodes)
 
-# 构建掩码：标记附着节点（被选中注入触发器的节点），初始为全 False
-attach_mask = torch.zeros(new_data.num_nodes, dtype=torch.bool, device=device)
-attach_mask[selected_all_nodes] = True  # 将附着节点的位置设为 True
 
-# 从非触发器节点中，去除附着节点后的剩余节点，构建训练池
+attach_mask = torch.zeros(new_data.num_nodes, dtype=torch.bool, device=device)
+attach_mask[selected_all_nodes] = True
+
 idx_pool = all_idx[non_trigger_mask & ~attach_mask]
 
-# 从训练池中划分出 60% 作为训练补充样本（idx_train_add），其余 40% 用于验证 + 测试
+
 idx_train_add, idx_temp = train_test_split(idx_pool.cpu(), test_size=0.4, random_state=42)
 
-# 将剩余 40% 再均分为验证集和测试集
+
 idx_val, idx_test = train_test_split(idx_temp, test_size=0.5, random_state=42)
 
-# 将新添加的训练索引转换回 GPU（因为 train_test_split 输出的是 CPU numpy array）
+
 idx_train_add = idx_train_add.to(device)
 
-# 最终训练集 = 附着节点 + 随机补充的非触发器非附着节点
 idx_train = torch.cat([selected_all_nodes, idx_train_add])
 
 loss_fn = nn.CrossEntropyLoss()
@@ -327,11 +306,10 @@ prompt_optimizer = torch.optim.Adam(prompt.parameters(), lr=args.train_lr, weigh
 legalCls_optimizer = torch.optim.Adam(legalCls.parameters(), lr=args.train_lr,
                                       weight_decay=args.weight_decay)
 
-print("\n[开始训练合法模型：GNN + Prompt]\n")
+
 val_acc_list = []
 test_acc_list = []
 
-# 第一阶段：训练 GNN + 分类器
 for epoch in range(1, args.epochs + 1):
     legalGNN.train()
     legalCls.train()
@@ -354,47 +332,36 @@ for epoch in range(1, args.epochs + 1):
         acc_test = (pred[idx_test] == new_data.y[idx_test]).float().mean().item()
     print(f"[Stage1] Epoch {epoch:03d} | Loss: {loss.item():.4f} | Val Acc: {acc_val:.4f} | Test Acc: {acc_test:.4f}")
 
-# ================================
-# 第二阶段：固定 GNN + 分类器，仅训练 Prompt
-# ================================
 
-# 冻结 GNN 和 分类器
+
 for param in legalGNN.parameters():
     param.requires_grad = False
 for param in legalCls.parameters():
     param.requires_grad = False
 
-# 构造 Prompt 的训练集和评估集
 all_idx = torch.arange(new_data.num_nodes, device=new_data.x.device)
 non_attach_idx = all_idx[~attach_mask]
-# 训练时用相同数量的非附着节点
 sampled_non_attach = non_attach_idx[torch.randperm(non_attach_idx.size(0))[:selected_all_nodes.size(0)]]
 idx_prompt_train = torch.cat([selected_all_nodes, sampled_non_attach])
 
-# 评估用节点（可以重采样，也可以扩展）
 idx_eval_attach = selected_all_nodes
 idx_eval_nonattach = non_attach_idx[torch.randperm(non_attach_idx.size(0))[:selected_all_nodes.size(0)]]
 
-# 初始化统计列表
 acc_attach_list = []
 acc_nonattach_list = []
 
-print("\n[开始第二阶段：仅优化 Prompt]\n")
 for epoch in range(1, args.epochs + 1):
     prompt.train()
     prompt_optimizer.zero_grad()
 
-    # 前向传播
-    h = legalGNN(new_data.x, new_data.edge_index)  # 固定 GNN 输出
-    h = prompt(h, attach_mask)  # 仅优化 Prompt
-    out, _ = legalCls(h)  # 固定分类器
+    h = legalGNN(new_data.x, new_data.edge_index)
+    h = prompt(h, attach_mask)
+    out, _ = legalCls(h)
 
-    # 损失函数仅对训练样本（附着节点+部分非附着节点）
     loss = loss_fn(out[idx_prompt_train], new_data.y[idx_prompt_train])
     loss.backward()
     prompt_optimizer.step()
 
-    # 评估附着节点和非附着节点准确率
     prompt.eval()
     with torch.no_grad():
         logits, _ = legalCls(prompt(legalGNN(new_data.x, new_data.edge_index), attach_mask))
@@ -409,19 +376,12 @@ for epoch in range(1, args.epochs + 1):
     print(f"[Stage2] Epoch {epoch:03d} | Prompt Loss: {loss.item():.4f} "
           f"| Attach Acc: {acc_attach:.4f} | Non-Attach Acc: {acc_nonattach:.4f}")
 
-# 平均准确率统计
 avg_attach_acc = sum(acc_attach_list) / len(acc_attach_list)
 avg_nonattach_acc = sum(acc_nonattach_list) / len(acc_nonattach_list)
 
 print(f"\n[Stage2] Average Accuracy on Attach Nodes     : {avg_attach_acc:.4f}")
 print(f"[Stage2] Average Accuracy on Non-Attach Nodes : {avg_nonattach_acc:.4f}")
-# 记录 GNN + Prompt 阶段平均准确率
-logging.info(f"[Stage2] Attach节点平均准确率: {avg_attach_acc:.4f}")
-logging.info(f"[Stage2] 非Attach节点平均准确率: {avg_nonattach_acc:.4f}")
-# --------------------------
-# 7. 可疑模型（仅 GNN）
-# --------------------------
-print("\n[开始训练可疑模型：不含Prompt，仅GCN]\n")
+
 if (args.model == 'GCN'):
     illegalGNN = GCN(input_dim=data.x.size(1), hid_dim=args.hidden, num_layer=args.num_layer,
                      drop_ratio=args.dropout).to(device)
@@ -469,15 +429,11 @@ for epoch in range(1, args.epochs):
 
     print(f"[Illegal] Epoch {epoch:03d} | Loss: {loss.item():.4f} | Val Acc: {acc_val:.4f} | Test Acc: {acc_test:.4f}")
 
-# === 平均结果 ===
 avg_val_acc_illegal = sum(val_acc_list_illegal) / len(val_acc_list_illegal)
 avg_test_acc_illegal = sum(test_acc_list_illegal) / len(test_acc_list_illegal)
 print(f"\n[Illegal] Average Val Accuracy: {avg_val_acc_illegal:.4f}")
 print(f"[Illegal] Average Test Accuracy: {avg_test_acc_illegal:.4f}")
 
-# 记录非法模型结果
-logging.info(f"[Illegal] 平均验证准确率: {avg_val_acc_illegal:.4f}")
-logging.info(f"[Illegal] 平均测试准确率: {avg_test_acc_illegal:.4f}")
 from sklearn.metrics.pairwise import pairwise_kernels
 
 
@@ -528,24 +484,6 @@ def verify_ownership(legalGNN, prompt, legalCls, illegalGNN, illegalCls, new_dat
 
     mmd_val = compute_mmd(legal_np, illegal_np)
     perm_mmd, p_value = permutation_test_mmd(legal_np, illegal_np)
-
-    print(f"标签一致性: {label_consistency:.4f}")
-    print(f"MMD值: {mmd_val:.4f}")
-    print(f"Permutation MMD值: {perm_mmd:.4f}, p-value: {p_value:.4f}")
-
-    # 记录验证阶段的统计结果
-    logging.info(f"标签一致性: {label_consistency:.4f}")
-    logging.info(f"MMD值: {mmd_val:.4f}")
-    logging.info(f"Permutation MMD: {perm_mmd:.4f}, p-value: {p_value:.4f}")
-    if p_value < 0.05:
-        print("【结论】合法模型与可疑模型输出分布显著不同 → 可能未使用水印数据。")
-    else:
-        print("【结论】合法模型与可疑模型输出分布相近 → 可能存在数据滥用。")
-
-    if label_consistency < 0.5:
-        print("【标签一致性判断】较低 → 模型输出差异明显。")
-    else:
-        print("【标签一致性判断】较高 → 模型输出行为相似。")
 
 
 verify_ownership(legalGNN, prompt, legalCls, illegalGNN, illegalCls, new_data, selected_all_nodes, attach_mask)
