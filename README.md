@@ -45,7 +45,13 @@ TAGFinger consists of three main components:
   <img src="images/fig2.jpg">
 </p>
 
-> 🎬 A 3-minute video overview is available at [`images/TAGFinger_Overview.mp4`](images/TAGFinger_Overview.mp4).
+## 🎬 Video Overview
+
+<p align="center">
+  <img src="images/overview.gif" alt="TAGFinger 3-minute overview (preview)">
+</p>
+
+> The full 3-minute narrated video is available at [`images/TAGFinger_Overview.mp4`](images/TAGFinger_Overview.mp4).
 
 ---
 
