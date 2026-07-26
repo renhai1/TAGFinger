@@ -2,57 +2,44 @@
 
 **TAGFinger: Semantic-Prompted Structural-Resilient Fingerprinting for Universal Ownership Verification of Text-Attribute Graphs**
 
-TAGFinger is a **non-intrusive dataset ownership verification framework** for **Text-Attributed Graphs (TAGs)**.  
-It leverages **LLM-generated prompt-cognizant stable perturbations** and **task-unified graph prompts** to extract transferable fingerprints that remain effective across **multiple datasets, tasks, and GNN architectures**.
+TAGFinger is a **non-intrusive dataset ownership verification (DOV) framework** for **text-attribute graphs (TAGs)**.
+Instead of relying on task-specific triggers, TAGFinger profiles fingerprints from the **inherent semantics and structures** of datasets, so that ownership can be verified across **diverse datasets, tasks, and GNN architectures** under fully black-box access.
 
-This repository provides the official implementation of TAGFinger, including surrogate model alignment, LLM-based perturbation generation, and universal verification protocols.
+This repository provides the official implementation of TAGFinger, including surrogate GNN alignment, LLM-based stable perturbation generation, and the universal verification protocol.
 
 ---
 
 ## 🔍 Motivation
 
-Text-attributed graphs are expensive to collect and curate, yet they are increasingly reused without authorization.  
-Existing dataset ownership verification methods often:
+Text-attribute graphs are expensive to collect and curate, yet they are increasingly reused without authorization.
+Existing DOV methods typically:
 
-- Depend on **task-specific triggers**
-- Fail under **multi-source training**
-- Break when **task or architecture changes**
+- Depend on **task-specific triggers** tightly coupled to a single dataset and objective
+- Fail under **multi-source training** (datasets mixed from different domains)
+- Break when the **task or architecture changes**
 
-TAGFinger addresses these limitations by extracting **semantic–structural fingerprints** that are:
+TAGFinger addresses these limitations with semantic-prompted structural-resilient fingerprints that are:
 
-- **Task-agnostic**
-- **Model-agnostic**
-- **Robust to distribution drift**
-- **Transferable across tasks and domains**
-
----
-
-## ✨ Key Features
-
-- **Prompt-Cognizant Stable Perturbations**
-  - LLM-generated textual perturbations anchored in structurally resilient regions
-- **Task-Unified Prompts (TUP)**
-  - Unified verification across node-, edge-, and graph-level tasks
-- **Generative Adversarial Knowledge Alignment**
-  - Surrogate GNN approximates the decision boundary of a black-box suspected model
-- **Non-Intrusive Verification**
-  - No modification to the original dataset or training pipeline
-- **High Robustness**
-  - Resistant to pruning, backdoor removal, and adaptive attacks
+- **Harmless**: no modification to the protected dataset
+- **Universal**: effective across node-, edge-, and graph-level tasks
+- **Robust**: stable under pruning, outlier detection, and backdoor defenses
+- **Transferable**: consistent across popular GNN architectures
 
 ---
 
 ## 🧠 Method Overview
 
-TAGFinger consists of three main stages:
+TAGFinger consists of three main components:
 
-1. **Generative Adversarial Knowledge Alignment**
-   - Train a surrogate GNN to mimic the suspected model’s decision boundary
-2. **Prompt-Cognizant Stable Perturbation Construction**
-   - Identify structurally resilient regions
-   - Use a fine-tunable LLM to generate semantic-preserving perturbations
-3. **Clue-Collected Transferable Verification**
-   - Aggregate fingerprint responses across unified tasks to confirm ownership
+1. **Sensitivity-Guided Adversarial Knowledge Alignment (SAKA)**
+   - A generative adversarial graph (GAG) generator actively exposes predictive discrepancies
+   - A distribution-aware constrainer (DAC) and a deviation-aware constrainer (DVC) align the surrogate GNN with the decision boundary of the black-box suspected model
+2. **Prompt-Amplified Stable Perturbation (PASP) Construction**
+   - Identify structurally resilient regions via stability scores
+   - Use an LLM with custom user contexts to generate semantic-preserving perturbations that induce consistent distribution drift
+3. **Evidence-Aggregated Transferable Ownership Verification**
+   - Task-unified prompts (TUP) reformulate disparate verification objectives into a shared graph representation space
+   - Task-level evidence is aggregated to confirm ownership under both single-source and multi-source settings
 
 <p align="center">
   <img src="images/fig2.jpg">
@@ -64,15 +51,56 @@ TAGFinger consists of three main stages:
 
 ```text
 TAGFinger/
-├── data/          # Dataset storage (Cora-ML, CiteSeerML, Reddit, etc.)
-├── evaluation/    # Evaluation scripts (VSR, robustness, transferability)
-├── images/        # Experimental figures and schematics
-├── llm/           # LLM configurations (prompt templates, perturbation generation)
-├── model/         # GNN model definitions (GCN/GAT/GIN/RGCN) and surrogate training
-├── pretrain/      # Pretrained model weights
-├── prompt/        # Task-Unified Prompt (TUP) templates
-├── tasker/        # Task processing modules (node/edge/graph-level task adaptation)
-├── utils/         # Utility functions (data preprocessing, metric calculation, config)
-├── clean_data.py  # Data cleaning and format conversion script
-├── ours.py        # Main running script (fingerprint generation, verification pipeline)
-└── README.md      # Project documentation
+├── data/           # Dataset loading, graph splitting, and induced-graph utilities
+├── evaluation/     # Evaluation protocols for different prompt/task settings
+├── images/         # Schematics and demo materials
+├── llm/            # LLM perturbation generation (prompt templates, LoRA fine-tuning)
+├── model/          # GNN backbones (GCN/GAT/GIN/GraphSAGE, etc.) and surrogate training
+├── pretrain/       # Pre-training strategies (DGI, GraphCL, GraphMAE, SimGRACE, etc.)
+├── prompt/         # Graph prompt implementations, including task-unified prompts
+├── tasker/         # Node-/edge-/graph-level task adaptation
+├── utils/          # Preprocessing, metrics, and configuration utilities
+├── clean_data..py  # Data cleaning and format conversion
+├── ours.py         # Main entry (fingerprint construction and verification pipeline)
+└── README.md
+```
+
+---
+
+## 🚀 Quick Start
+
+### Requirements
+
+- Python 3.9+
+- PyTorch
+- PyTorch Geometric
+- scikit-learn, numpy
+
+### Run
+
+```bash
+# Fingerprint construction and ownership verification
+python ours.py --dataset Cora --model GCN
+
+# Options
+#   --dataset  {Cora, Citeseer, PubMed, Flickr}
+#   --model    {GCN, GAT, GraphSage, GIN}
+#   --total_select   number of fingerprint nodes
+#   --trigger_size   perturbation region size
+```
+
+LoRA fine-tuning for the LLM perturbation generator is provided in `llm/train_lora.py`.
+
+---
+
+## 📊 Main Results
+
+- Verification accuracy **above 95.4%** across representative TAG datasets
+- **Above 93.2%** accuracy under various attacks (vs. 36.3% of competitive baselines on Reddit)
+- **Above 93.5%** accuracy when transferring across popular GNN architectures
+
+---
+
+## 📄 License
+
+This repository is released for research purposes only.
