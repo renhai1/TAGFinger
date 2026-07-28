@@ -91,10 +91,13 @@ TAGFinger/
 python ours.py --dataset Cora --model GCN
 
 # Options
-#   --dataset  {Cora, Citeseer, PubMed, Flickr}
-#   --model    {GCN, GAT, GraphSage, GIN}
-#   --total_select   number of fingerprint nodes
-#   --trigger_size   perturbation region size
+#   --dataset        {Cora, Citeseer, PubMed, Flickr}
+#   --model          {GCN, GAT, GraphSage, GIN}   suspected GNN
+#   --surrogate_model {GCN, GAT, GraphSage, GIN}  surrogate GNN
+#   --total_select   number of fingerprint target nodes
+#   --topk_stable    top-k stable neighbors forming each stable region
+#   --lam            trade-off coefficient of the distribution drift term
+#   --llm_path       local LLM (e.g., Qwen3-8B) for PASP text generation
 ```
 
 LoRA fine-tuning for the LLM perturbation generator is provided in `llm/train_lora.py`.

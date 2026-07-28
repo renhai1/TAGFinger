@@ -1,8 +1,10 @@
-
-
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from prompts import PERTURB_PROMPTS
 import torch
+
+try:
+    from .prompts import PASP_PROMPT, PERTURB_PROMPTS
+except ImportError:
+    from prompts import PASP_PROMPT, PERTURB_PROMPTS
 
 
 class LLMPerturbator:
@@ -18,9 +20,7 @@ class LLMPerturbator:
         self.device = device
 
     @torch.no_grad()
-    def perturb(self, text, perturb_type="lexical", max_new_tokens=128):
-        prompt = PERTURB_PROMPTS[perturb_type].format(text=text)
-
+    def _generate(self, prompt, max_new_tokens):
         inputs = self.tokenizer(
             prompt, return_tensors="pt"
         ).to(self.model.device)
@@ -32,9 +32,21 @@ class LLMPerturbator:
             temperature=0.8,
             top_p=0.9
         )
+        return self.tokenizer.decode(
+            outputs[0][inputs["input_ids"].size(1):], skip_special_tokens=True
+        ).strip()
 
-        gen_text = self.tokenizer.decode(
-            outputs[0], skip_special_tokens=True
+    def generate_pasp(self, subgraph_texts, structure, target_label,
+                      max_new_tokens=256):
+        """delta_i ~ P_psi(delta | X_i, Gamma(G_i), y*)."""
+        texts = "\n".join(
+            f"- Node {node_id}: {text}" for node_id, text in subgraph_texts
         )
+        prompt = PASP_PROMPT.format(
+            texts=texts, structure=structure, target_label=target_label
+        )
+        return self._generate(prompt, max_new_tokens)
 
-        return gen_text.split("Text:")[-1].strip()
+    def perturb(self, text, perturb_type="lexical", max_new_tokens=128):
+        prompt = PERTURB_PROMPTS[perturb_type].format(text=text)
+        return self._generate(prompt, max_new_tokens)

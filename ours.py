@@ -1,26 +1,38 @@
+"""TAGFinger: Semantic-Prompted Structural-Resilient Fingerprinting for
+Universal Ownership Verification of Text-Attribute Graphs.
+
+Pipeline (fully black-box interaction with the suspected GNN):
+  1. Sensitivity-guided adversarial knowledge alignment (SAKA) trains a
+     surrogate GNN that mimics the decision boundary of the suspected model.
+  2. Prompt-amplified stable perturbation (PASP) construction anchors
+     LLM-guided perturbations in structurally resilient regions and
+     jointly optimizes them with task-unified prompts (TUP):
+        max_{delta_i, {p_tau}} sum_tau q_tau(y*) + lambda * Delta_i.
+  3. Evidence-aggregated transferable ownership verification collects the
+     tri-valued fingerprint evidence r_tau in {1, 0, -1} and aggregates it
+     over the task set with threshold theta to output
+     violated / unviolated / uncertain.
+"""
+
 import argparse
-import pickle
-
-import numpy as np
-import torch_geometric.transforms as T
-from torch_geometric.datasets import Flickr
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.datasets import Planetoid
-from torch_geometric.data import Data
-from torch_geometric.utils import to_undirected
-from sklearn.model_selection import train_test_split
-from collections import defaultdict
-from NodeClassifier import NodeClassifier
-
-from model import GCN, GAT, GIN, GraphSAGE
-
-from prompt_graph.MyPrompt import MyPrompt
-
 import os
 import logging
 from datetime import datetime
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch_geometric.transforms as T
+from torch_geometric.data import Data
+from torch_geometric.datasets import Planetoid, Flickr
+from torch_geometric.utils import subgraph
+
+from model import GCN, GAT, GIN, GraphSAGE, NodeClassifier
+from model.SAKA import BlackBoxGNN, GAGGenerator, train_saka
+from prompt.TUP import TaskUnifiedPrompt
+from utils.pasp import (stability_scores, select_stable_region,
+                        structural_description, distribution_drift)
 
 
 def init_logger(log_dir="logs", prefix="experiment"):
@@ -45,12 +57,14 @@ def init_logger(log_dir="logs", prefix="experiment"):
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--debug', action='store_true',
-                    default=True, help='debug mode')
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='Disables CUDA training.')
 parser.add_argument('--seed', type=int, default=10, help='Random seed.')
-parser.add_argument('--model', type=str, default='GCN', help='model',
+parser.add_argument('--model', type=str, default='GCN',
+                    help='architecture of the suspected GNN',
+                    choices=['GCN', 'GAT', 'GraphSage', 'GIN'])
+parser.add_argument('--surrogate_model', type=str, default='GCN',
+                    help='architecture of the surrogate GNN',
                     choices=['GCN', 'GAT', 'GraphSage', 'GIN'])
 parser.add_argument('--dataset', type=str, default='Cora',
                     help='Dataset',
@@ -62,428 +76,322 @@ parser.add_argument('--weight_decay', type=float, default=5e-4,
 parser.add_argument('--hidden', type=int, default=128,
                     help='Number of hidden units.')
 parser.add_argument('--num_layer', type=int, default=3,
-                    help='Number of num_layer')
-
-# parser.add_argument('--thrd', type=float, default=0.5)
-
+                    help='Number of GNN layers.')
 parser.add_argument('--dropout', type=float, default=0.5,
                     help='Dropout rate (1 - keep probability).')
+parser.add_argument('--epochs', type=int, default=200,
+                    help='Number of epochs to train GNN models.')
 
-parser.add_argument('--n_trials', type=int, default=5,
-                    help='n_trials')
+# SAKA settings
+parser.add_argument('--saka_epochs', type=int, default=100,
+                    help='Number of alternating min-max epochs for SAKA.')
+parser.add_argument('--x_budget', type=float, default=0.05,
+                    help='Attribute perturbation budget of the GAG generator.')
+parser.add_argument('--edge_budget', type=float, default=0.01,
+                    help='Structural perturbation budget of the GAG generator.')
 
-parser.add_argument('--epochs', type=int, default=200, help='Number of epochs to train GNN model.')
-
-parser.add_argument('--trigger_epochs', type=int, default=200, help='Number of epochs to train trigger generator.')
-
-# trigger setting
-parser.add_argument('--trigger_size', type=int, default=3,
-                    help='tirgger_size')
-
+# PASP settings
 parser.add_argument('--total_select', type=int, default=80,
-                    help="number of poisoning nodes total_select")
+                    help='Number of fingerprint target nodes.')
+parser.add_argument('--topk_stable', type=int, default=5,
+                    help='Top-k stable neighbors forming the stable region V_i.')
+parser.add_argument('--delta_budget', type=float, default=0.1,
+                    help='Budget of the fingerprint perturbation delta_i.')
+parser.add_argument('--lam', type=float, default=1.0,
+                    help='Trade-off coefficient lambda of the drift term.')
+parser.add_argument('--pasp_epochs', type=int, default=100,
+                    help='Epochs for jointly optimizing delta_i and prompts.')
+parser.add_argument('--pasp_lr', type=float, default=0.01,
+                    help='Learning rate for delta_i and prompt optimization.')
+parser.add_argument('--llm_path', type=str, default=None,
+                    help='Path of the local LLM (e.g., Qwen3-8B) used to '
+                         'generate prompt-amplified stable perturbations.')
 
-parser.add_argument('--cosine_loss', type=float, default=0.01,
-                    help="cosine_loss")
+# TUP settings
+parser.add_argument('--prompt_tokens', type=int, default=10,
+                    help='Number of tokens in each task prompt graph.')
+parser.add_argument('--num_hops', type=int, default=2,
+                    help='Number of hops of the induced subgraph in Phi_tau.')
+parser.add_argument('--cross_prune', type=float, default=0.1,
+                    help='Cross-edge pruning threshold of the prompt graph.')
+parser.add_argument('--inner_prune', type=float, default=0.01,
+                    help='Inner-edge pruning threshold of the prompt graph.')
 
-parser.add_argument('--dist_loss', type=float, default=0.01,
-                    help="dist_loss")
+# verification settings
+parser.add_argument('--theta', type=int, default=2,
+                    help='Evidence threshold theta in the multi-source setting '
+                         '(majority voting over the three tasks).')
+
 # GPU setting
-parser.add_argument('--device_id', type=int, default=0,
-                    help="Threshold of prunning edges")
+parser.add_argument('--device_id', type=int, default=0, help='GPU id.')
 
-args = parser.parse_args()
 args = parser.parse_known_args()[0]
 args.cuda = not args.no_cuda and torch.cuda.is_available()
-device = torch.device(('cuda:{}' if torch.cuda.is_available() else 'cpu').format(args.device_id))
+device = torch.device(
+    ('cuda:{}' if args.cuda else 'cpu').format(args.device_id))
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed(args.seed)
 print(args)
 log_file = init_logger()
+log = logging.info
 
 
 transform = T.Compose([T.NormalizeFeatures()])
-if (args.dataset == 'Cora' or args.dataset == 'Citeseer' or args.dataset == 'PubMed'):
-    dataset = Planetoid(root='./data/Planetoid',
-                        name=args.dataset,
+if args.dataset in ('Cora', 'Citeseer', 'PubMed'):
+    dataset = Planetoid(root='./data/Planetoid', name=args.dataset,
                         transform=transform)
-elif (args.dataset == 'Flickr'):
-    dataset = Flickr(root='./data/Flickr/',
-                     transform=transform)
-data = dataset[0]
-data = data.to(device)
-
-
-def find_consistently_misclassified_nodes(data, num_classes, train_idx, test_idx):
-    misclass_record = defaultdict(lambda: [0] * data.num_nodes)
-    acc_list = []
-    for trial in range(args.n_trials):
-        model = GCN(input_dim=data.x.size(1), hid_dim=args.hidden, num_layer=args.num_layer,
-                    drop_ratio=args.dropout).to(device)
-        classifier = NodeClassifier(hid_dim=args.hidden, num_classes=num_classes, dropout=args.dropout,
-                                    inner_dim=args.hidden).to(device)
-        model_optimizer = torch.optim.Adam(model.parameters(), lr=args.train_lr, weight_decay=args.weight_decay)
-        classifier_optimizer = torch.optim.Adam(classifier.parameters(), lr=args.train_lr,
-                                                weight_decay=args.weight_decay)
-        model.train()
-        classifier.train()
-        for epoch in range(args.epochs):
-            model_optimizer.zero_grad()
-            classifier_optimizer.zero_grad()
-            node_embding = model(data.x, data.edge_index)
-            out, _ = classifier(node_embding)
-            loss = F.cross_entropy(out[train_idx], data.y[train_idx])
-            loss.backward()
-            model_optimizer.step()
-            classifier_optimizer.step()
-
-        model.eval()
-        classifier.eval()
-        with torch.no_grad():
-            logits, _ = classifier(model(data.x, data.edge_index))
-            preds = logits.argmax(dim=1)
-            acc = (preds[test_idx] == data.y[test_idx]).float().mean().item()
-            acc_list.append(acc)
-            print(f"[Trial {trial + 1}] Accuracy = {acc:.4f}")
-            for i in range(data.num_nodes):
-                if preds[i] != data.y[i]:
-                    misclass_record[trial][i] = 1
-
-
-    total_errors = np.sum([misclass_record[t] for t in range(args.n_trials)], axis=0)
-    always_wrong = np.where(total_errors == args.n_trials)[0]
-
-    base = args.total_select // num_classes
-    remainder = args.total_select % num_classes
-    per_class_allocation = [base + (1 if i < remainder else 0) for i in range(num_classes)]
-
-    selected_nodes_per_class = {}
-    for c in range(num_classes):
-        candidates = [i for i in always_wrong if data.y[i].item() == c]
-        if len(candidates) > per_class_allocation[c]:
-            selected = np.random.choice(candidates, per_class_allocation[c], replace=False)
-        else:
-            selected = candidates
-        selected_nodes_per_class[c] = selected
-
-    save_path = './saved_indices/'
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
-    save_file = os.path.join(save_path, f'{args.dataset}_{args.n_trials}_{args.total_select}_selected_nodes.pkl')
-    with open(save_file, 'wb') as f:
-        pickle.dump(selected_nodes_per_class, f)
-    return selected_nodes_per_class
-
-def load_selected_nodes(save_path='./saved_indices/'):
-    file_path = os.path.join(save_path, f'{args.dataset}_{args.n_trials}_{args.total_select}_selected_nodes.pkl')
-    if os.path.exists(file_path):
-        with open(file_path, 'rb') as f:
-            selected_nodes_per_class = pickle.load(f)
-        return selected_nodes_per_class
-    else:
-        return None
-
-
-
-def inject_trigger_and_optimize(data, target_nodes):
-    from scipy.stats import wasserstein_distance
-    orig_x = data.x.clone().detach()
-    orig_y = data.y.clone().detach()
-    orig_edge_index = data.edge_index.clone().detach()
-    num_orig_nodes = data.num_nodes
-    feature_dim = orig_x.size(1)
-    total_triggers = len(target_nodes) * args.trigger_size
-    trigger_features = torch.randn((total_triggers, feature_dim), requires_grad=True, device=data.x.device)
-    trigger_labels = []
-    for node in target_nodes:
-        label = orig_y[node].item()
-        trigger_labels.extend([label] * args.trigger_size)
-    trigger_labels = torch.tensor(trigger_labels, device=data.x.device)
-    new_edges = []
-    for idx, node in enumerate(target_nodes):
-        base = idx * args.trigger_size + num_orig_nodes
-        for i in range(args.trigger_size):
-            for j in range(i + 1, args.trigger_size):
-                new_edges.append([base + i, base + j])
-                new_edges.append([base + j, base + i])
-        for i in range(args.trigger_size):
-            new_edges.append([base + i, node])
-            new_edges.append([node, base + i])
-    new_edges = torch.tensor(new_edges, dtype=torch.long, device=data.x.device).t()
-    new_edge_index = to_undirected(torch.cat([orig_edge_index, new_edges], dim=1))
-    optimizer = torch.optim.Adam([trigger_features], lr=args.train_lr)
-    for curepoch in range(args.trigger_epochs):
-        # for curepoch in range(10):
-        optimizer.zero_grad()
-        cosine_loss = 0
-        for idx, node in enumerate(target_nodes):
-            base = idx * args.trigger_size
-            target_feat = orig_x[node]
-            trig_feats = trigger_features[base:base + args.trigger_size]
-            cos_sim = F.cosine_similarity(trig_feats, target_feat.unsqueeze(0).expand_as(trig_feats), dim=1)
-            cosine_loss += (1 - cos_sim).mean()
-        cosine_loss /= len(target_nodes)
-        trigger_flat = trigger_features.view(-1).detach().cpu().numpy()
-        orig_flat = orig_x.view(-1).detach().cpu().numpy()
-        dist_loss = wasserstein_distance(trigger_flat, orig_flat)
-        dist_loss = torch.tensor(dist_loss, dtype=torch.float, device=data.x.device)
-        loss = args.cosine_loss * cosine_loss + args.dist_loss * dist_loss
-        print(
-            f"[Epoch {curepoch}] Cosine Loss: {cosine_loss:.4f}, Dist Loss: {dist_loss:.4f}, Total Loss: {loss:.4f}")
-        loss.backward()
-        optimizer.step()
-    new_x = torch.cat([orig_x, trigger_features.detach()], dim=0)
-    new_y = torch.cat([orig_y, trigger_labels], dim=0)
-    return Data(x=new_x, edge_index=new_edge_index, y=new_y)
-
-
-train_idx = data.train_mask.nonzero(as_tuple=False).view(-1)
-test_idx = data.test_mask.nonzero(as_tuple=False).view(-1)
+elif args.dataset == 'Flickr':
+    dataset = Flickr(root='./data/Flickr/', transform=transform)
+data = dataset[0].to(device)
 num_classes = dataset.num_classes
-
-selected_nodes = load_selected_nodes()
-if selected_nodes is None:
-    selected_nodes = find_consistently_misclassified_nodes(data, num_classes, train_idx, test_idx)
-
-selected_all_nodes = []
-for nodes in selected_nodes.values():
-    selected_all_nodes.extend(nodes)
-selected_all_nodes = torch.tensor(selected_all_nodes, dtype=torch.long, device=device)
-
-print(selected_all_nodes)
-
-new_data = inject_trigger_and_optimize(data=data, target_nodes=selected_all_nodes)
+raw_texts = getattr(data, 'raw_texts', None)
 
 
-trigger_nodes = torch.arange(data.num_nodes, new_data.num_nodes, device=device)
+def build_gnn(name):
+    gnn_cls = {'GCN': GCN, 'GAT': GAT, 'GraphSage': GraphSAGE, 'GIN': GIN}[name]
+    return gnn_cls(input_dim=data.x.size(1), hid_dim=args.hidden,
+                   num_layer=args.num_layer, drop_ratio=args.dropout).to(device)
 
 
-all_idx = torch.arange(new_data.num_nodes, device=device)
+def train_blackbox(train_data, tag):
+    """Train a GNN on the given graph; only its probability vectors will be
+    exposed to the verification pipeline through BlackBoxGNN.query."""
+    gnn = build_gnn(args.model)
+    classifier = NodeClassifier(hid_dim=args.hidden, num_classes=num_classes,
+                                dropout=args.dropout,
+                                inner_dim=args.hidden).to(device)
+    gnn_opt = torch.optim.Adam(gnn.parameters(), lr=args.train_lr,
+                               weight_decay=args.weight_decay)
+    cls_opt = torch.optim.Adam(classifier.parameters(), lr=args.train_lr,
+                               weight_decay=args.weight_decay)
+    train_idx = train_data.train_mask.nonzero(as_tuple=False).view(-1)
+    test_idx = train_data.test_mask.nonzero(as_tuple=False).view(-1)
+    loss_fn = nn.CrossEntropyLoss()
+    for epoch in range(1, args.epochs + 1):
+        gnn.train()
+        classifier.train()
+        gnn_opt.zero_grad()
+        cls_opt.zero_grad()
+        out, _ = classifier(gnn(train_data.x, train_data.edge_index))
+        loss = loss_fn(out[train_idx], train_data.y[train_idx])
+        loss.backward()
+        gnn_opt.step()
+        cls_opt.step()
+    gnn.eval()
+    classifier.eval()
+    with torch.no_grad():
+        logits, _ = classifier(gnn(train_data.x, train_data.edge_index))
+        acc = (logits.argmax(dim=1)[test_idx] ==
+               train_data.y[test_idx]).float().mean().item()
+    log(f"[{tag}] test accuracy: {acc:.4f}")
+    return BlackBoxGNN(gnn, classifier)
 
 
-non_trigger_mask = ~torch.isin(all_idx, trigger_nodes)
+def make_independent_data(original):
+    """A GNN trained on this shifted variant plays the innocent model that
+    never used the protected TAG dataset."""
+    perm = torch.randperm(original.num_nodes, device=device)
+    x = original.x[perm]
+    num_edges = original.edge_index.size(1)
+    rewired = original.edge_index[:, torch.randperm(num_edges, device=device)]
+    rewired = torch.stack([original.edge_index[0], rewired[1]], dim=0)
+    return Data(x=x, edge_index=rewired, y=original.y,
+                train_mask=original.train_mask,
+                test_mask=original.test_mask).to(device)
 
 
-attach_mask = torch.zeros(new_data.num_nodes, dtype=torch.bool, device=device)
-attach_mask[selected_all_nodes] = True
-
-idx_pool = all_idx[non_trigger_mask & ~attach_mask]
-
-
-idx_train_add, idx_temp = train_test_split(idx_pool.cpu(), test_size=0.4, random_state=42)
+# ---------------------------------------------------------------------------
+# Step 0: suspected model (unauthorized usage) and independent model
+# ---------------------------------------------------------------------------
+suspected = train_blackbox(data, "Suspected")
+independent = train_blackbox(make_independent_data(data), "Independent")
 
 
-idx_val, idx_test = train_test_split(idx_temp, test_size=0.5, random_state=42)
+# ---------------------------------------------------------------------------
+# Step 1: SAKA — surrogate GNN aligned with the suspected decision boundary
+# ---------------------------------------------------------------------------
+surrogate = build_gnn(args.surrogate_model)
+surrogate_cls = NodeClassifier(hid_dim=args.hidden, num_classes=num_classes,
+                               dropout=args.dropout,
+                               inner_dim=args.hidden).to(device)
+generator = GAGGenerator(feat_dim=data.x.size(1), hid_dim=args.hidden,
+                         x_budget=args.x_budget,
+                         edge_budget=args.edge_budget).to(device)
+train_saka(surrogate, surrogate_cls, generator, suspected, data,
+           epochs=args.saka_epochs, lr=args.train_lr,
+           weight_decay=args.weight_decay, log_fn=log)
+surrogate.eval()
+surrogate_cls.eval()
 
 
-idx_train_add = idx_train_add.to(device)
-
-idx_train = torch.cat([selected_all_nodes, idx_train_add])
-
-loss_fn = nn.CrossEntropyLoss()
-new_data = new_data.to(device)
-
-if (args.model == 'GCN'):
-    legalGNN = GCN(input_dim=data.x.size(1), hid_dim=args.hidden, num_layer=args.num_layer,
-                   drop_ratio=args.dropout).to(device)
-elif (args.model == 'GAT'):
-    legalGNN = GAT(input_dim=data.x.size(1), hid_dim=args.hidden, num_layer=args.num_layer,
-                   drop_ratio=args.dropout).to(device)
-elif (args.model == 'GraphSage'):
-    legalGNN = GraphSAGE(input_dim=data.x.size(1), hid_dim=args.hidden, num_layer=args.num_layer,
-                         drop_ratio=args.dropout).to(device)
-elif (args.model == 'GIN'):
-    legalGNN = GIN(input_dim=data.x.size(1), hid_dim=args.hidden, num_layer=args.num_layer,
-                   drop_ratio=args.dropout).to(device)
-prompt = MyPrompt(args.hidden).to(device)
-
-legalCls = NodeClassifier(hid_dim=args.hidden, num_classes=num_classes, dropout=args.dropout,
-                          inner_dim=args.hidden).to(device)
-
-legalGNN_optimizer = torch.optim.Adam(legalGNN.parameters(), lr=args.train_lr, weight_decay=args.weight_decay)
-prompt_optimizer = torch.optim.Adam(prompt.parameters(), lr=args.train_lr, weight_decay=args.weight_decay)
-legalCls_optimizer = torch.optim.Adam(legalCls.parameters(), lr=args.train_lr,
-                                      weight_decay=args.weight_decay)
+def surrogate_probs(x, edge_index):
+    logits, _ = surrogate_cls(surrogate(x, edge_index))
+    return F.softmax(logits, dim=1)
 
 
-val_acc_list = []
-test_acc_list = []
+# ---------------------------------------------------------------------------
+# Step 2: PASP — fingerprints anchored in structurally resilient regions
+# ---------------------------------------------------------------------------
+with torch.no_grad():
+    probs_clean = surrogate_probs(data.x, data.edge_index)
+scores = stability_scores(probs_clean, data.edge_index, data.num_nodes)
 
-for epoch in range(1, args.epochs + 1):
-    legalGNN.train()
-    legalCls.train()
-    legalGNN_optimizer.zero_grad()
-    legalCls_optimizer.zero_grad()
+base = args.total_select // num_classes
+remainder = args.total_select % num_classes
+fingerprint_nodes = []
+for c in range(num_classes):
+    quota = base + (1 if c < remainder else 0)
+    candidates = (data.y == c).nonzero(as_tuple=False).view(-1)
+    if candidates.numel() == 0:
+        continue
+    top = scores[candidates].topk(min(quota, candidates.numel())).indices
+    fingerprint_nodes.extend(candidates[top].tolist())
+fingerprint_nodes = torch.tensor(fingerprint_nodes, dtype=torch.long,
+                                 device=device)
+log(f"[PASP] selected {fingerprint_nodes.numel()} fingerprint nodes "
+    f"in structurally resilient regions")
 
-    h = legalGNN(new_data.x, new_data.edge_index)
-    out, _ = legalCls(h)
-    loss = loss_fn(out[idx_train], new_data.y[idx_train])
+regions, region_edge_indices, edge_partners, target_labels = [], [], [], []
+clean_preds = probs_clean.argmax(dim=1)
+for v in fingerprint_nodes.tolist():
+    region = select_stable_region(v, scores, data.edge_index, args.topk_stable)
+    regions.append(region)
+    region_ei, _ = subgraph(region, data.edge_index, relabel_nodes=True,
+                            num_nodes=data.num_nodes)
+    region_edge_indices.append(region_ei)
+    edge_partners.append(int(region[1]) if region.numel() > 1 else v)
+    # target label y*: the runner-up class of the surrogate prediction
+    target_labels.append(int(probs_clean[v].topk(2).indices[1]))
+target_labels = torch.tensor(target_labels, dtype=torch.long, device=device)
+
+llm_perturbator = None
+if args.llm_path is not None:
+    from llm.generator import LLMPerturbator
+    llm_perturbator = LLMPerturbator(args.llm_path, device=str(device))
+
+delta_texts = []
+if llm_perturbator is not None and raw_texts is not None:
+    for i, v in enumerate(fingerprint_nodes.tolist()):
+        subgraph_texts = [(int(u), raw_texts[int(u)]) for u in regions[i]]
+        gamma = structural_description(v, regions[i], data.edge_index)
+        delta_texts.append(llm_perturbator.generate_pasp(
+            subgraph_texts, gamma, str(int(target_labels[i]))))
+    log(f"[PASP] LLM generated {len(delta_texts)} text-level perturbations")
+
+# feature-space counterpart of delta_i, jointly refined with the prompts
+delta = nn.Parameter(0.01 * torch.randn(
+    fingerprint_nodes.numel(), data.x.size(1), device=device))
+
+
+def perturbed_features(base_x):
+    x_pert = base_x.clone()
+    x_pert[fingerprint_nodes] = base_x[fingerprint_nodes] + \
+        args.delta_budget * torch.tanh(delta)
+    return x_pert
+
+
+# ---------------------------------------------------------------------------
+# Step 3: TUP — joint optimization  max sum_tau q_tau(y*) + lambda * Delta_i
+# ---------------------------------------------------------------------------
+tup = TaskUnifiedPrompt(token_dim=data.x.size(1),
+                        token_num=args.prompt_tokens,
+                        cross_prune=args.cross_prune,
+                        inner_prune=args.inner_prune,
+                        num_hops=args.num_hops).to(device)
+pasp_opt = torch.optim.Adam([delta] + list(tup.parameters()), lr=args.pasp_lr)
+
+
+def task_instances(i, x_source):
+    v = int(fingerprint_nodes[i])
+    return {
+        'node': v,
+        'edge': (v, edge_partners[i]),
+        'graph': Data(x=x_source[regions[i]],
+                      edge_index=region_edge_indices[i]),
+    }
+
+
+for epoch in range(1, args.pasp_epochs + 1):
+    tup.train()
+    pasp_opt.zero_grad()
+    x_pert = perturbed_features(data.x)
+    probs_pert = surrogate_probs(x_pert, data.edge_index)
+    objective = 0.0
+    for i in range(fingerprint_nodes.numel()):
+        drift = distribution_drift(probs_clean, probs_pert, regions[i])
+        q_sum = 0.0
+        for tau, instance in task_instances(i, x_pert).items():
+            q_tau = tup.task_probability(tau, instance, x_pert,
+                                         data.edge_index, surrogate_probs)
+            q_sum = q_sum + q_tau[target_labels[i]]
+        objective = objective + q_sum + args.lam * drift
+    loss = -objective / fingerprint_nodes.numel()
     loss.backward()
-    legalGNN_optimizer.step()
-    legalCls_optimizer.step()
-
-    legalGNN.eval()
-    legalCls.eval()
-    with torch.no_grad():
-        logits, _ = legalCls(legalGNN(new_data.x, new_data.edge_index))
-        pred = logits.argmax(dim=1)
-        acc_val = (pred[idx_val] == new_data.y[idx_val]).float().mean().item()
-        acc_test = (pred[idx_test] == new_data.y[idx_test]).float().mean().item()
-    print(f"[Stage1] Epoch {epoch:03d} | Loss: {loss.item():.4f} | Val Acc: {acc_val:.4f} | Test Acc: {acc_test:.4f}")
+    pasp_opt.step()
+    log(f"[PASP-TUP] Epoch {epoch:03d} | objective: {-loss.item():.4f}")
 
 
-
-for param in legalGNN.parameters():
-    param.requires_grad = False
-for param in legalCls.parameters():
-    param.requires_grad = False
-
-all_idx = torch.arange(new_data.num_nodes, device=new_data.x.device)
-non_attach_idx = all_idx[~attach_mask]
-sampled_non_attach = non_attach_idx[torch.randperm(non_attach_idx.size(0))[:selected_all_nodes.size(0)]]
-idx_prompt_train = torch.cat([selected_all_nodes, sampled_non_attach])
-
-idx_eval_attach = selected_all_nodes
-idx_eval_nonattach = non_attach_idx[torch.randperm(non_attach_idx.size(0))[:selected_all_nodes.size(0)]]
-
-acc_attach_list = []
-acc_nonattach_list = []
-
-for epoch in range(1, args.epochs + 1):
-    prompt.train()
-    prompt_optimizer.zero_grad()
-
-    h = legalGNN(new_data.x, new_data.edge_index)
-    h = prompt(h, attach_mask)
-    out, _ = legalCls(h)
-
-    loss = loss_fn(out[idx_prompt_train], new_data.y[idx_prompt_train])
-    loss.backward()
-    prompt_optimizer.step()
-
-    prompt.eval()
-    with torch.no_grad():
-        logits, _ = legalCls(prompt(legalGNN(new_data.x, new_data.edge_index), attach_mask))
-        pred = logits.argmax(dim=1)
-
-        acc_attach = (pred[idx_eval_attach] == new_data.y[idx_eval_attach]).float().mean().item()
-        acc_nonattach = (pred[idx_eval_nonattach] == new_data.y[idx_eval_nonattach]).float().mean().item()
-
-        acc_attach_list.append(acc_attach)
-        acc_nonattach_list.append(acc_nonattach)
-
-    print(f"[Stage2] Epoch {epoch:03d} | Prompt Loss: {loss.item():.4f} "
-          f"| Attach Acc: {acc_attach:.4f} | Non-Attach Acc: {acc_nonattach:.4f}")
-
-avg_attach_acc = sum(acc_attach_list) / len(acc_attach_list)
-avg_nonattach_acc = sum(acc_nonattach_list) / len(acc_nonattach_list)
-
-print(f"\n[Stage2] Average Accuracy on Attach Nodes     : {avg_attach_acc:.4f}")
-print(f"[Stage2] Average Accuracy on Non-Attach Nodes : {avg_nonattach_acc:.4f}")
-
-if (args.model == 'GCN'):
-    illegalGNN = GCN(input_dim=data.x.size(1), hid_dim=args.hidden, num_layer=args.num_layer,
-                     drop_ratio=args.dropout).to(device)
-elif (args.model == 'GAT'):
-    illegalGNN = GAT(input_dim=data.x.size(1), hid_dim=args.hidden, num_layer=args.num_layer,
-                     drop_ratio=args.dropout).to(device)
-elif (args.model == 'GraphSage'):
-    illegalGNN = GraphSAGE(input_dim=data.x.size(1), hid_dim=args.hidden, num_layer=args.num_layer,
-                           drop_ratio=args.dropout).to(device)
-elif (args.model == 'GIN'):
-    illegalGNN = GIN(input_dim=data.x.size(1), hid_dim=args.hidden, num_layer=args.num_layer,
-                     drop_ratio=args.dropout).to(device)
-
-illegalGNN_optimizer = torch.optim.Adam(illegalGNN.parameters(), lr=args.train_lr, weight_decay=args.weight_decay)
-illegalCls = NodeClassifier(hid_dim=args.hidden, num_classes=num_classes, dropout=args.dropout,
-                            inner_dim=args.hidden).to(device)
-illegalCls_optimizer = torch.optim.Adam(illegalCls.parameters(), lr=args.train_lr,
-                                        weight_decay=args.weight_decay)
-
-val_acc_list_illegal = []
-test_acc_list_illegal = []
-
-for epoch in range(1, args.epochs):
-    illegalGNN.train()
-    illegalCls.train()
-    illegalGNN_optimizer.zero_grad()
-    illegalCls_optimizer.zero_grad()
-
-    out, _ = illegalCls(illegalGNN(new_data.x, new_data.edge_index))
-    loss = loss_fn(out[idx_train], new_data.y[idx_train])
-    loss.backward()
-    illegalGNN_optimizer.step()
-    illegalCls_optimizer.step()
-
-    illegalGNN.eval()
-    illegalCls.eval()
-    with torch.no_grad():
-        logits, _ = illegalCls(illegalGNN(new_data.x, new_data.edge_index))
-        pred = logits.argmax(dim=1)
-        acc_val = (pred[idx_val] == new_data.y[idx_val]).float().mean().item()
-        acc_test = (pred[idx_test] == new_data.y[idx_test]).float().mean().item()
-
-        val_acc_list_illegal.append(acc_val)
-        test_acc_list_illegal.append(acc_test)
-
-    print(f"[Illegal] Epoch {epoch:03d} | Loss: {loss.item():.4f} | Val Acc: {acc_val:.4f} | Test Acc: {acc_test:.4f}")
-
-avg_val_acc_illegal = sum(val_acc_list_illegal) / len(val_acc_list_illegal)
-avg_test_acc_illegal = sum(test_acc_list_illegal) / len(test_acc_list_illegal)
-print(f"\n[Illegal] Average Val Accuracy: {avg_val_acc_illegal:.4f}")
-print(f"[Illegal] Average Test Accuracy: {avg_test_acc_illegal:.4f}")
-
-from sklearn.metrics.pairwise import pairwise_kernels
+# ---------------------------------------------------------------------------
+# Step 4: evidence-aggregated transferable ownership verification
+# ---------------------------------------------------------------------------
+def fingerprint_evidence(pred_pert, pred_clean, y_star):
+    """r_tau(v_i): 1 = drift toward y*, 0 = no drift, -1 = inconsistent drift."""
+    if pred_pert == y_star:
+        return 1
+    if pred_pert == pred_clean:
+        return 0
+    return -1
 
 
-def compute_mmd(X, Y, kernel='rbf', gamma=1.0):
-    XX = pairwise_kernels(X, X, metric=kernel, gamma=gamma)
-    YY = pairwise_kernels(Y, Y, metric=kernel, gamma=gamma)
-    XY = pairwise_kernels(X, Y, metric=kernel, gamma=gamma)
-    mmd = XX.mean() + YY.mean() - 2 * XY.mean()
-    return mmd
+def ownership_decision(evidence, theta):
+    if sum(1 for r in evidence if r == 1) >= theta:
+        return 'violated'
+    if sum(1 for r in evidence if r == -1) >= theta:
+        return 'unviolated'
+    return 'uncertain'
 
 
-def permutation_test_mmd(x, y, num_perm=1000):
-    combined = np.vstack([x, y])
-    n = len(x)
-    observed = compute_mmd(x, y)
-    count = 0
-    for _ in range(num_perm):
-        np.random.shuffle(combined)
-        x_perm = combined[:n]
-        y_perm = combined[n:]
-        if compute_mmd(x_perm, y_perm) >= observed:
-            count += 1
-    p_value = count / num_perm
-    return observed, p_value
+@torch.no_grad()
+def verify_ownership(blackbox, tag):
+    """Query the suspected GNN on the fingerprinted graph appended with each
+    task-unified prompt graph, and aggregate cross-task evidence."""
+    tup.eval()
+    x_pert = perturbed_features(data.x)
+    probs_fn = blackbox.query
+
+    decisions_single, decisions_multi = [], []
+    for i in range(fingerprint_nodes.numel()):
+        y_star = int(target_labels[i])
+        evidence = {}
+        clean_instances = task_instances(i, data.x)
+        pert_instances = task_instances(i, x_pert)
+        for tau in TaskUnifiedPrompt.TASKS:
+            q_clean = tup.task_probability(tau, clean_instances[tau], data.x,
+                                           data.edge_index, probs_fn)
+            q_pert = tup.task_probability(tau, pert_instances[tau], x_pert,
+                                          data.edge_index, probs_fn)
+            evidence[tau] = fingerprint_evidence(
+                int(q_pert.argmax()), int(q_clean.argmax()), y_star)
+        # single-source: T' = {node} with theta = 1
+        decisions_single.append(ownership_decision([evidence['node']], 1))
+        # multi-source: T' = all tasks with theta set by majority voting
+        decisions_multi.append(
+            ownership_decision(list(evidence.values()), args.theta))
+
+    vsr_single = np.mean([d == 'violated' for d in decisions_single])
+    vsr_multi = np.mean([d == 'violated' for d in decisions_multi])
+    log(f"[Verify-{tag}] single-source (T'={{node}}, theta=1) "
+        f"violated rate: {vsr_single:.4f}")
+    log(f"[Verify-{tag}] multi-source (T'=all, theta={args.theta}) "
+        f"violated rate: {vsr_multi:.4f}")
+    return vsr_single, vsr_multi
 
 
-def verify_ownership(legalGNN, prompt, legalCls, illegalGNN, illegalCls, new_data, selected_all_nodes, attach_mask):
-    legalGNN.eval()
-    prompt.eval()
-    legalCls.eval()
-    illegalGNN.eval()
-    illegalCls.eval()
+vsr_sus_single, vsr_sus_multi = verify_ownership(suspected, "Suspected")
+fpr_ind_single, fpr_ind_multi = verify_ownership(independent, "Independent")
 
-    with torch.no_grad():
-        legal_logits, _ = legalCls(prompt(legalGNN(new_data.x, new_data.edge_index), attach_mask))
-        # legal_logits, _ = legalCls(legalGNN(new_data.x, new_data.edge_index))
-        legal_probs = F.softmax(legal_logits[selected_all_nodes], dim=1)
-        legal_preds = legal_logits[selected_all_nodes].argmax(dim=1)
-
-        illegal_logits, _ = illegalCls(prompt(illegalGNN(new_data.x, new_data.edge_index), attach_mask))
-        # illegal_logits, _ = illegalCls(illegalGNN(new_data.x, new_data.edge_index))
-        illegal_probs = F.softmax(illegal_logits[selected_all_nodes], dim=1)
-        illegal_preds = illegal_logits[selected_all_nodes].argmax(dim=1)
-
-    label_consistency = (legal_preds == illegal_preds).float().mean().item()
-    legal_np = legal_probs.cpu().numpy()
-    illegal_np = illegal_probs.cpu().numpy()
-
-    mmd_val = compute_mmd(legal_np, illegal_np)
-    perm_mmd, p_value = permutation_test_mmd(legal_np, illegal_np)
-
-
-verify_ownership(legalGNN, prompt, legalCls, illegalGNN, illegalCls, new_data, selected_all_nodes, attach_mask)
+log(f"[Result] VSR on suspected GNN  | single: {vsr_sus_single:.4f} "
+    f"| multi: {vsr_sus_multi:.4f}")
+log(f"[Result] FPR on independent GNN | single: {fpr_ind_single:.4f} "
+    f"| multi: {fpr_ind_multi:.4f}")

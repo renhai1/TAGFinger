@@ -7,11 +7,7 @@ import torch
 import torch.nn as nn
 from torch_geometric.datasets import Planetoid
 
-from NodeClassifier import NodeClassifier
-
-from model import GCN, GAT, GIN, GraphSAGE
-
-from prompt_graph.MyPrompt import MyPrompt
+from model import GCN, GAT, GIN, GraphSAGE, NodeClassifier
 
 import os
 import logging
@@ -104,12 +100,10 @@ elif args.model == 'GIN':
     legalGNN = GIN(input_dim=data.x.size(1), hid_dim=args.hidden, num_layer=args.num_layer, drop_ratio=args.dropout).to(
         device)
 
-prompt = MyPrompt(args.hidden).to(device)
 legalCls = NodeClassifier(hid_dim=args.hidden, num_classes=num_classes, dropout=args.dropout, inner_dim=args.hidden).to(
     device)
 
 legalGNN_optimizer = torch.optim.Adam(legalGNN.parameters(), lr=args.train_lr, weight_decay=args.weight_decay)
-prompt_optimizer = torch.optim.Adam(prompt.parameters(), lr=args.train_lr, weight_decay=args.weight_decay)
 legalCls_optimizer = torch.optim.Adam(legalCls.parameters(), lr=args.train_lr, weight_decay=args.weight_decay)
 
 
@@ -134,34 +128,4 @@ for epoch in range(1, args.epochs + 1):
         acc_val = (pred[val_idx] == data.y[val_idx]).float().mean().item()
         acc_test = (pred[test_idx] == data.y[test_idx]).float().mean().item()
     print(f"[Stage1] Epoch {epoch:03d} | Loss: {loss.item():.4f} | Val Acc: {acc_val:.4f} | Test Acc: {acc_test:.4f}")
-
-for p in legalGNN.parameters():
-    p.requires_grad = False
-for p in legalCls.parameters():
-    p.requires_grad = False
-
-test_acc_list = []
-
-for epoch in range(1, args.epochs + 1):
-    prompt.train()
-    prompt_optimizer.zero_grad()
-
-    h = legalGNN(data.x, data.edge_index)
-    h = prompt(h)
-    out, _ = legalCls(h)
-    loss = loss_fn(out[train_idx], data.y[train_idx])
-    loss.backward()
-    prompt_optimizer.step()
-
-    prompt.eval()
-    with torch.no_grad():
-        logits, _ = legalCls(prompt(legalGNN(data.x, data.edge_index)))
-        pred = logits.argmax(dim=1)
-        acc_val = (pred[val_idx] == data.y[val_idx]).float().mean().item()
-        acc_test = (pred[test_idx] == data.y[test_idx]).float().mean().item()
-        test_acc_list.append(acc_test)
-
-    print(
-        f"[Stage2] Epoch {epoch:03d} | Prompt Loss: {loss.item():.4f} | Val Acc: {acc_val:.4f} | Test Acc: {acc_test:.4f}")
-
 
