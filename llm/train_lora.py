@@ -1,4 +1,9 @@
+"""LoRA fine-tuning of the LLM perturbation generator P_psi.
 
+Appendix D: the fine-tuned Qwen3-8B model is used as the local LLM. It is
+fine-tuned for 50 epochs on graph-structured text data using the Adam
+optimizer with learning rate 1e-5 and weight decay 0.005.
+"""
 
 from transformers import (
     AutoTokenizer,
@@ -10,7 +15,7 @@ from trl import SFTTrainer
 from datasets import load_dataset
 
 
-MODEL_NAME = "Qwen/Qwen2-7B-Instruct"
+MODEL_NAME = "Qwen/Qwen3-8B"
 DATA_PATH = "perturb_data.jsonl"
 OUTPUT_DIR = "perturb_llm_lora"
 
@@ -54,8 +59,10 @@ def main():
             output_dir=OUTPUT_DIR,
             per_device_train_batch_size=2,
             gradient_accumulation_steps=4,
-            learning_rate=2e-4,
-            num_train_epochs=3,
+            learning_rate=1e-5,
+            weight_decay=0.005,
+            optim="adamw_torch",
+            num_train_epochs=50,
             logging_steps=10,
             save_strategy="epoch",
             fp16=True

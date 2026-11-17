@@ -1,26 +1,68 @@
 """Prompt templates for LLM-based fingerprint perturbation generation.
 
-PASP_PROMPT conditions the LLM on (i) the textual attributes X_i of the
-stable subgraph G_i, (ii) the structural description Gamma(G_i), and
-(iii) the target label y* conveyed through the user-defined fingerprint
-objective, i.e., delta_i ~ P_psi(delta | X_i, Gamma(G_i), y*) (Eq. 6).
+The user prompt templates are transcribed from Appendix C (Figures 9 and 10)
+of the paper, for single-source and multi-source dataset ownership
+verification. The user content conveys (i) the textual attributes X_i of the
+target node and its stable neighbors, (ii) the structural description
+Gamma(G_i) of the induced subgraph, and (iii) the target label y* specified
+by the fingerprint objective, i.e., delta_i ~ P_psi(delta | X_i, Gamma(G_i),
+y*) (Eq. 6).
 """
 
-PASP_PROMPT = (
-    "You are generating a prompt-amplified stable perturbation (fingerprint) "
-    "for a text-attribute graph.\n\n"
-    "Textual attributes of the stable subgraph nodes:\n{texts}\n\n"
-    "Structural description of the subgraph:\n{structure}\n\n"
-    "Fingerprint objective: rewrite the text of the target node with a subtle "
-    "and natural-looking perturbation so that the classification probability "
-    "distribution of a model trained on this dataset drifts toward the target "
-    "label \"{target_label}\", while the perturbed text remains fluent, "
-    "semantically plausible, and indistinguishable from normal data.\n\n"
-    "Return only the perturbed text of the target node."
+USER_PROMPT_SINGLE = (
+    "In the context of graph neural network ownership verification, models "
+    "may exhibit latent behavioral signatures learned from a specific "
+    "training dataset.\n"
+    "Your task is to assist in constructing a subtle semantic perturbation "
+    "that can serve as a reliable fingerprint for single-source "
+    "verification.\n"
+    "You should focus on preserving the original semantic meaning of the "
+    "node attributes while introducing a minimally invasive yet detectable "
+    "modification.\n"
+    "The perturbation should be localized within a stable subgraph region "
+    "and induce a consistent shift in the model's classification "
+    "probability vectors without altering graph semantics."
+)
+
+USER_PROMPT_MULTI = (
+    "In the context of graph neural network ownership verification under "
+    "multi-source training conditions, a suspected model may be trained on "
+    "a mixture of datasets with unknown proportions.\n"
+    "Your role is to generate a semantically coherent perturbation that "
+    "remains effective even when the model has only partially or implicitly "
+    "learned the target dataset.\n"
+    "The perturbation should be robust to dataset heterogeneity, preserve "
+    "semantic plausibility, and induce a transferable distribution drift in "
+    "the classification probability vectors within a stable subgraph region."
+)
+
+USER_CONTENT_TEMPLATE = (
+    "Target node {node_id} with textual attributes:\n{target_text}\n\n"
+    "Stable neighbor nodes with textual attributes:\n{neighbor_texts}\n\n"
+    "Subgraph structure description:\n{structure}\n\n"
+    "Target label specified by the fingerprint objective: {target_label}\n\n"
+    "Propose edits to the texts of nodes in this stable region so that the "
+    "classification probability distribution drifts toward the target label "
+    "while the edited texts remain fluent and semantically plausible.\n"
+    "Return each edit on its own line in the format 'Node <id>: <edited text>'."
 )
 
 
-# Auxiliary label-preserving templates used for ablation studies.
+def build_pasp_prompt(node_id, target_text, neighbor_texts, structure,
+                      target_label, mode="single"):
+    """Assemble the user prompt and user content of Appendix C."""
+    system = USER_PROMPT_MULTI if mode == "multi" else USER_PROMPT_SINGLE
+    neighbors = "\n".join(
+        f"- Node {nid}: {text}" for nid, text in neighbor_texts
+    )
+    content = USER_CONTENT_TEMPLATE.format(
+        node_id=node_id, target_text=target_text,
+        neighbor_texts=neighbors, structure=structure,
+        target_label=target_label)
+    return f"{system}\n\n{content}"
+
+
+# Auxiliary label-preserving templates used to build fine-tuning data.
 PERTURB_PROMPTS = {
     "lexical": (
         "Generate a lexically perturbed version of the following text. "

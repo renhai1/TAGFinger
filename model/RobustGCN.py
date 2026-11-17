@@ -284,3 +284,58 @@ class RobustGCNConv(nn.Module):
             var = adj1 @ var
             # print("mean1",mean.shape)
         return mean, var
+
+
+class RGCN(nn.Module):
+    """RobustGCN backbone with the same interface as GCN/GAT/GIN.
+
+    RGCN denotes Robust Graph Convolutional Networks (Zhu et al., 2019),
+    included to assess verification against a model designed for adversarial
+    robustness. The Gaussian convolution's variance attention down-weights
+    uncertain neighborhood messages; the mean embeddings are returned for
+    the downstream node/graph classifiers.
+    """
+
+    def __init__(self, input_dim, hid_dim=None, out_dim=None, num_layer=2,
+                 JK="last", drop_ratio=0.5, pool='mean'):
+        super().__init__()
+        if hid_dim is None:
+            hid_dim = int(0.618 * input_dim)
+        if out_dim is None:
+            out_dim = hid_dim
+        if num_layer < 2:
+            raise ValueError('GNN layer_num should >=2 but you set {}'.format(num_layer))
+        layers = [RobustGCNConv(input_dim, hid_dim, initial=True, dropout=drop_ratio)]
+        for _ in range(num_layer - 2):
+            layers.append(RobustGCNConv(hid_dim, hid_dim, dropout=drop_ratio))
+        layers.append(RobustGCNConv(hid_dim, out_dim, dropout=drop_ratio))
+        self.layers = nn.ModuleList(layers)
+        self.JK = JK
+        self.drop_ratio = drop_ratio
+        if pool == 'mean':
+            from torch_geometric.nn import global_mean_pool
+            self.pool = global_mean_pool
+        elif pool == 'sum':
+            from torch_geometric.nn import global_add_pool
+            self.pool = global_add_pool
+        elif pool == 'max':
+            from torch_geometric.nn import global_max_pool
+            self.pool = global_max_pool
+        else:
+            raise ValueError("Invalid graph pooling type.")
+
+    def forward(self, x, edge_index, batch=None, prompt=None, prompt_type=None):
+        num_nodes = x.size(0)
+        adj_t = SparseTensor.from_edge_index(
+            edge_index, sparse_sizes=(num_nodes, num_nodes))
+        adj0 = gcn_norm(adj_t.clone(), order=-0.5)
+        adj1 = gcn_norm(adj_t.clone(), order=-1.0)
+        mean, var = x, x
+        for layer in self.layers:
+            mean, var = layer(mean, var=var, adj0=adj0, adj1=adj1)
+        node_emb = mean
+        if batch is None:
+            return node_emb
+        if prompt_type == 'Gprompt':
+            node_emb = prompt(node_emb)
+        return self.pool(node_emb, batch.long())

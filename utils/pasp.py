@@ -33,6 +33,28 @@ def select_stable_region(node, scores, edge_index, k):
     return torch.cat([center, neighbors])
 
 
+def select_fingerprint_nodes(scores, edge_index, num_nodes, total, k):
+    """Greedily sample target nodes so that their stable regions are pairwise
+    disjoint (Appendix D), matching the independence condition of the
+    verification error bound (Proposition 5). Nodes are considered in
+    decreasing order of their stability scores.
+    """
+    order = scores.argsort(descending=True)
+    used = torch.zeros(num_nodes, dtype=torch.bool, device=scores.device)
+    selected = []
+    for v in order.tolist():
+        if used[v]:
+            continue
+        region = select_stable_region(v, scores, edge_index, k)
+        if used[region].any():
+            continue
+        selected.append(v)
+        used[region] = True
+        if len(selected) >= total:
+            break
+    return torch.tensor(selected, dtype=torch.long, device=scores.device)
+
+
 def structural_description(node, region, edge_index):
     """Gamma(G_i): natural-language semantic abstraction of the stable subgraph."""
     node = int(node)

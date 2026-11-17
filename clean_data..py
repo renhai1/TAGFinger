@@ -1,131 +1,101 @@
+"""Prepare the TAG datasets used in the paper.
+
+Encodes the raw textual attributes of a TAG with a shared text encoder and
+saves the files expected by ``data/tag_data.py`` under ``<out_root>/<name>/``:
+features.pt, edge_index.pt, labels.pt, texts.jsonl, split.pt.
+
+Raw input format (--raw_file, one JSON record per node, in node order):
+  {"text": "...", "label": 0, "edges": [1, 5, 9]}
+or {"title": "...", "abstract": "...", "label": 0, "edges": [...]}.
+
+Encoders reported in Appendix E: GCN_LLMEmb for Cora-ML / CiteSeer-ML,
+ENGINE for ArXiv-HepPh / ArXiv-CS, TAPE for Reddit. When mixing datasets,
+encode all sources with the SAME language model so that node features share
+one dimension (Appendix D); --text_encoder accepts any local HuggingFace
+encoder checkpoint.
+
+Example:
+  python clean_data..py --name Cora-ML --raw_file raw/cora_ml.jsonl \
+      --text_encoder /path/to/encoder --out_root data/TAG
+"""
+
 import argparse
-
-import numpy as np
-import torch_geometric.transforms as T
-from torch_geometric.datasets import Flickr
-import torch
-import torch.nn as nn
-from torch_geometric.datasets import Planetoid
-
-from model import GCN, GAT, GIN, GraphSAGE, NodeClassifier
-
+import json
 import os
-import logging
-from datetime import datetime
+
+import torch
+
+from data.tag_data import TAG_DATASETS
+from utils.text_encoder import TextEncoder
 
 
-def init_logger(log_dir="logs", prefix="experiment_clean"):
-    os.makedirs(log_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(log_dir, f"{prefix}_{timestamp}.log")
-    logging.basicConfig(
-        filename=log_path,
-        filemode='w',
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-    )
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--name', type=str, required=True,
+                        choices=list(TAG_DATASETS))
+    parser.add_argument('--raw_file', type=str, required=True,
+                        help='JSONL with one record per node')
+    parser.add_argument('--text_encoder', type=str, required=True,
+                        help='Local text encoder checkpoint')
+    parser.add_argument('--out_root', type=str, default='data/TAG')
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--device', type=str, default='cpu')
+    args = parser.parse_args()
 
-    console = logging.StreamHandler()
-    console.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    console.setFormatter(formatter)
-    logging.getLogger('').addHandler(console)
+    texts, labels, adjacency = [], [], []
+    with open(args.raw_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            obj = json.loads(line)
+            if 'text' in obj:
+                texts.append(obj['text'])
+            else:
+                texts.append(f"{obj.get('title', '')}. "
+                             f"{obj.get('abstract', '')}")
+            labels.append(int(obj['label']))
+            adjacency.append([int(u) for u in obj.get('edges', [])])
 
-    return log_path
+    num_nodes = len(texts)
+    src, dst = [], []
+    for v, neighbors in enumerate(adjacency):
+        for u in neighbors:
+            src.append(v)
+            dst.append(u)
+            src.append(u)
+            dst.append(v)
+    edge_index = torch.tensor([src, dst], dtype=torch.long)
+    y = torch.tensor(labels, dtype=torch.long)
+    if int(y.max()) + 1 > TAG_DATASETS[args.name]:
+        raise ValueError(
+            f"{args.name} expects {TAG_DATASETS[args.name]} classes, "
+            f"found {int(y.max()) + 1}")
 
+    encoder = TextEncoder(args.text_encoder, device=args.device)
+    x = encoder.encode(texts)
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--debug', action='store_true',
-                    default=True, help='debug mode')
-parser.add_argument('--no-cuda', action='store_true', default=False,
-                    help='Disables CUDA training.')
-parser.add_argument('--seed', type=int, default=10, help='Random seed.')
-parser.add_argument('--model', type=str, default='GIN', help='model',
-                    choices=['GCN', 'GAT', 'GraphSage', 'GIN'])
-parser.add_argument('--dataset', type=str, default='Flickr',
-                    help='Dataset',
-                    choices=['Cora', 'PubMed', 'Citeseer', 'Flickr'])
-parser.add_argument('--train_lr', type=float, default=0.01,
-                    help='Initial learning rate.')
-parser.add_argument('--weight_decay', type=float, default=5e-4,
-                    help='Weight decay (L2 loss on parameters).')
-parser.add_argument('--hidden', type=int, default=128,
-                    help='Number of hidden units.')
-parser.add_argument('--num_layer', type=int, default=3,
-                    help='Number of num_layer')
-parser.add_argument('--dropout', type=float, default=0.5,
-                    help='Dropout rate (1 - keep probability).')
-parser.add_argument('--epochs', type=int, default=200, help='Number of epochs to train GNN model.')
-parser.add_argument('--device_id', type=int, default=0, help="GPU device ID")
+    generator = torch.Generator().manual_seed(args.seed)
+    perm = torch.randperm(num_nodes, generator=generator)
+    n_train = int(0.6 * num_nodes)
+    n_val = int(0.2 * num_nodes)
+    train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    train_mask[perm[:n_train]] = True
+    val_mask[perm[n_train:n_train + n_val]] = True
+    test_mask[perm[n_train + n_val:]] = True
 
-args = parser.parse_args()
-args = parser.parse_known_args()[0]
-args.cuda = not args.no_cuda and torch.cuda.is_available()
-device = torch.device(('cuda:{}' if torch.cuda.is_available() else 'cpu').format(args.device_id))
-np.random.seed(args.seed)
-torch.manual_seed(args.seed)
-torch.cuda.manual_seed(args.seed)
-print(args)
-log_file = init_logger()
-
-transform = T.Compose([T.NormalizeFeatures()])
-if args.dataset in ['Cora', 'Citeseer', 'PubMed']:
-    dataset = Planetoid(root='./data/Planetoid', name=args.dataset, transform=transform)
-elif args.dataset == 'Flickr':
-    dataset = Flickr(root='./data/Flickr/', transform=transform)
-data = dataset[0].to(device)
-num_classes = dataset.num_classes
-loss_fn = nn.CrossEntropyLoss()
-
-all_idx = torch.randperm(data.num_nodes)
-n_total = data.num_nodes
-n_train = int(0.7 * n_total)
-n_val = int(0.2 * n_total)
-n_test = n_total - n_train - n_val
-
-train_idx = all_idx[:n_train]
-val_idx = all_idx[n_train:n_train + n_val]
-test_idx = all_idx[n_train + n_val:]
-
-if args.model == 'GCN':
-    legalGNN = GCN(input_dim=data.x.size(1), hid_dim=args.hidden, num_layer=args.num_layer, drop_ratio=args.dropout).to(
-        device)
-elif args.model == 'GAT':
-    legalGNN = GAT(input_dim=data.x.size(1), hid_dim=args.hidden, num_layer=args.num_layer, drop_ratio=args.dropout).to(
-        device)
-elif args.model == 'GraphSage':
-    legalGNN = GraphSAGE(input_dim=data.x.size(1), hid_dim=args.hidden, num_layer=args.num_layer,
-                         drop_ratio=args.dropout).to(device)
-elif args.model == 'GIN':
-    legalGNN = GIN(input_dim=data.x.size(1), hid_dim=args.hidden, num_layer=args.num_layer, drop_ratio=args.dropout).to(
-        device)
-
-legalCls = NodeClassifier(hid_dim=args.hidden, num_classes=num_classes, dropout=args.dropout, inner_dim=args.hidden).to(
-    device)
-
-legalGNN_optimizer = torch.optim.Adam(legalGNN.parameters(), lr=args.train_lr, weight_decay=args.weight_decay)
-legalCls_optimizer = torch.optim.Adam(legalCls.parameters(), lr=args.train_lr, weight_decay=args.weight_decay)
+    folder = os.path.join(args.out_root, args.name)
+    os.makedirs(folder, exist_ok=True)
+    torch.save(x, os.path.join(folder, 'features.pt'))
+    torch.save(edge_index, os.path.join(folder, 'edge_index.pt'))
+    torch.save(y, os.path.join(folder, 'labels.pt'))
+    torch.save({'train_mask': train_mask, 'val_mask': val_mask,
+                'test_mask': test_mask}, os.path.join(folder, 'split.pt'))
+    with open(os.path.join(folder, 'texts.jsonl'), 'w', encoding='utf-8') as f:
+        for text in texts:
+            f.write(json.dumps({'text': text}, ensure_ascii=False) + '\n')
+    print(f"[Prep] {args.name}: {num_nodes} nodes, {edge_index.size(1)} "
+          f"directed edges, feature dim {x.size(1)} -> {folder}")
 
 
-for epoch in range(1, args.epochs + 1):
-    legalGNN.train()
-    legalCls.train()
-    legalGNN_optimizer.zero_grad()
-    legalCls_optimizer.zero_grad()
-
-    h = legalGNN(data.x, data.edge_index)
-    out, _ = legalCls(h)
-    loss = loss_fn(out[train_idx], data.y[train_idx])
-    loss.backward()
-    legalGNN_optimizer.step()
-    legalCls_optimizer.step()
-
-    legalGNN.eval()
-    legalCls.eval()
-    with torch.no_grad():
-        logits, _ = legalCls(legalGNN(data.x, data.edge_index))
-        pred = logits.argmax(dim=1)
-        acc_val = (pred[val_idx] == data.y[val_idx]).float().mean().item()
-        acc_test = (pred[test_idx] == data.y[test_idx]).float().mean().item()
-    print(f"[Stage1] Epoch {epoch:03d} | Loss: {loss.item():.4f} | Val Acc: {acc_val:.4f} | Test Acc: {acc_test:.4f}")
-
+if __name__ == '__main__':
+    main()
