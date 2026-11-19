@@ -46,9 +46,11 @@ def reformulate(tau, instance, x, edge_index, num_hops=2):
             sub_edge_index = sub_edge_index[:, keep]
         return Data(x=x[subset], edge_index=sub_edge_index)
     if tau == 'graph':
-        if isinstance(instance, Data):
-            return instance
-        return Data(x=x, edge_index=edge_index)
+        if not isinstance(instance, Data):
+            raise ValueError("The graph task requires an explicit original graph instance")
+        if getattr(instance, 'y', None) is None or instance.y.numel() != 1:
+            raise ValueError("The graph instance must retain its original graph label")
+        return instance
     raise ValueError(f"unknown task: {tau}")
 
 

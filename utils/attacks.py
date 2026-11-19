@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.utils import subgraph
+from data.graph_instances import copy_graph_annotations
 
 
 def _remove_nodes(data, keep_mask):
@@ -35,7 +36,7 @@ def _remove_nodes(data, keep_mask):
     for key in ("num_classes", "owner_num_classes", "dataset_name"):
         if hasattr(data, key):
             setattr(out, key, getattr(data, key))
-    return out
+    return copy_graph_annotations(data, out, node_ids=keep)
 
 
 def _edge_similarity(data):

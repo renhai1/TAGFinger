@@ -100,6 +100,46 @@ python clean_data..py --name Cora-ML --raw_file raw/cora_ml.jsonl \
 Each dataset directory contains `features.pt`, `edge_index.pt`, `labels.pt`, `texts.jsonl`, `split.pt`.
 For mixed-dataset experiments, encode all sources with the **same** language model (13 classes for Cora-ML/CiteSeer-ML, 48 for Cora-ML/Reddit).
 
+#### Original graph instances (required only for the graph task)
+
+The graph task uses **whole source-provided graphs and their original graph
+labels**, not k-hop subgraphs labeled by the majority node class. Node-only
+TAG files do not establish a graph-classification task. Supply
+`<data_root>/<dataset>/graph_instances.pt` from the original graph dataset:
+
+```python
+torch.save({
+    "graph_index": original_graph_id_per_node.long(),  # shape [N]
+    "labels": original_graph_labels.long(),            # shape [G]
+    "num_classes": original_graph_class_count,          # int, >= 2
+    "train_mask": original_graph_train_mask.bool(),    # shape [G]
+    "val_mask": original_graph_val_mask.bool(),
+    "test_mask": original_graph_test_mask.bool(),
+}, "data/TAG/<dataset>/graph_instances.pt")
+```
+
+The feature/edge files must represent the disjoint union of these original
+graphs in the same node order. Graph IDs are contiguous `0..G-1`; every graph
+has nodes, edges cannot join different graphs, and the graph-level splits
+must be disjoint and complete. `labels.pt` remains the **node** labels;
+`graph_instances.pt["labels"]` defines a separate graph-class label space.
+Do not invent graph boundaries or labels from connected components or node
+majorities when the source dataset does not provide them.
+
+Training samples complete graphs from the graph-level training split. SAKA
+and fingerprint verification also query complete graph instances; PASP only
+changes the selected node features within the graph. No graph cropping or
+graph-label replacement occurs. Node-removal attacks retain the graph label
+of each surviving instance. For graph-task mixtures, both sources need this
+metadata, sampling retains whole graphs, and `--mix_ratio` specifies the
+fraction of **graph instances selected from each source**, not a node-level
+mixture ratio. The graph-class offset is separate from the node-class offset.
+This mode must not be treated as a reproduction of node-sampled mixtures.
+
+Without genuine graph-level data, use `--tasks node` or `--tasks node edge`.
+Requesting the graph task without its metadata fails explicitly rather than
+silently generating a proxy graph task.
+
 ### 2. Fine-tune the LLM generator (optional)
 
 ```bash
@@ -109,23 +149,28 @@ python llm/train_lora.py   # Qwen3-8B, 50 epochs, Adam lr 1e-5, weight decay 0.0
 ### 3. Fingerprint construction and ownership verification
 
 ```bash
-python ours.py --dataset Cora-ML --model GCN \
+python ours.py --dataset Cora-ML --model GCN --tasks node edge \
     --llm_path /path/to/finetuned-Qwen3-8B \
     --text_encoder /path/to/encoder
 ```
 
 Pre-generated LLM edits can be reused via `--pert_cache edits.json` (`{node_id: {edited_node_id: text}}`).
+For all three tasks, add `--tasks node edge graph` after preparing the original
+graph metadata above. The default still requests all three tasks and therefore
+requires that metadata. The node task is required for surrogate-based stable
+region construction.
 
 ### Key options (defaults follow Appendix D)
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--dataset` | `Cora-ML` | `{Cora-ML, CiteSeer-ML, ArXiv-HepPh, ArXiv-CS, Reddit}` |
+| `--tasks` | `node edge graph` | Explicit task set; graph requires original graph metadata |
 | `--model` / `--surrogate_model` | `GCN` | `{GCN, GAT, GIN, RGCN}` (RGCN = RobustGCN) |
 | `--total_select` | `200` | Number m of fingerprint perturbations |
 | `--topk_stable` | `2` | Stable region size k |
 | `--lam` | `0.5` | Trade-off coefficient λ of the drift term |
-| `--theta` | `2` | Multi-source majority-voting threshold ϑ |
+| `--theta` | strict majority | Evidence threshold ϑ; defaults to 2 for three tasks, 1 for node only |
 | `--hidden` / `--num_layer` | `128` / `2` | GNN width / depth |
 | `--saka_epochs` / `--patience` | `500` / `50` | SAKA epochs / early stopping |
 | `--saka_lr` | `1e-3` | Surrogate learning rate |
@@ -152,6 +197,10 @@ python ours.py --dataset Cora-ML --no_tup ...
 ```
 
 Paper results are averaged over 5 runs with seeds `{0, 1, 2, 3, 4}` (`--seed`).
+
+Run graph-instance regression tests with `python -m unittest discover -s tests`.
+Runtime tensor tests require PyTorch and PyTorch Geometric; missing dependencies
+are reported as skipped tests, not successful runtime validation.
 
 ---
 

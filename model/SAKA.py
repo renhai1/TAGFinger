@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.utils import k_hop_subgraph, subgraph
+from data.graph_instances import original_graph_nodes, require_original_graphs
 
 
 class BlackBoxGNN:
@@ -110,14 +111,25 @@ def dvc_loss(p_sur_tilde, p_sur, p_sus_tilde, p_sus):
     return dev.pow(2).sum(dim=1).mean()
 
 
-def sample_alignment_instances(data, num_hops, num_instances):
+def sample_alignment_instances(data, num_hops, num_instances,
+                               tasks=('node', 'edge', 'graph')):
     """Task instances for graph-level alignment: node-centered subgraphs,
-    endpoint-centered subgraphs, and larger graph-level subgraphs."""
+    endpoint-centered subgraphs, and entire original graph instances."""
     num_nodes = data.num_nodes
     instances = []
-    tasks = ('node', 'edge', 'graph')
+    if not tasks:
+        return instances
+    if 'graph' in tasks:
+        require_original_graphs(data)
     for j in range(num_instances):
         tau = tasks[j % len(tasks)]
+        if tau == 'graph':
+            node = int(torch.randint(num_nodes, (1,)).item())
+            subset = original_graph_nodes(data, int(data.graph_index[node]))
+            sub_ei, _ = subgraph(subset, data.edge_index, relabel_nodes=True,
+                                 num_nodes=num_nodes)
+            instances.append((tau, subset, sub_ei))
+            continue
         if tau == 'edge' and data.edge_index.size(1) > 0:
             e = int(torch.randint(data.edge_index.size(1), (1,)).item())
             centers = data.edge_index[:, e].tolist()
@@ -125,7 +137,7 @@ def sample_alignment_instances(data, num_hops, num_instances):
         else:
             tau = 'node' if tau == 'edge' else tau
             centers = [int(torch.randint(num_nodes, (1,)).item())]
-            hops = num_hops if tau == 'node' else num_hops + 1
+            hops = num_hops
         subset, sub_ei, _, _ = k_hop_subgraph(
             centers, hops, data.edge_index,
             relabel_nodes=True, num_nodes=num_nodes)
@@ -144,6 +156,7 @@ def train_saka(surrogate, classifier, generator, blackbox, data,
     and task instances (patience 50, Appendix D).
     """
     graph_heads = graph_heads if graph_heads is not None else {}
+    alignment_tasks = tuple(graph_heads)
     sur_params = list(surrogate.parameters()) + list(classifier.parameters())
     for head in graph_heads.values():
         sur_params += list(head.parameters())
@@ -208,7 +221,8 @@ def train_saka(surrogate, classifier, generator, blackbox, data,
 
     # fixed held-out batches for early stopping
     val_nodes = torch.randperm(data.num_nodes)[:batch_nodes]
-    val_instances = sample_alignment_instances(data, num_hops, batch_graphs)
+    val_instances = sample_alignment_instances(data, num_hops, batch_graphs,
+                                               tasks=alignment_tasks)
 
     best_val = float('inf')
     best_state = None
@@ -216,7 +230,8 @@ def train_saka(surrogate, classifier, generator, blackbox, data,
 
     for epoch in range(1, epochs + 1):
         nodes = torch.randperm(data.num_nodes)[:batch_nodes]
-        instances = sample_alignment_instances(data, num_hops, batch_graphs)
+        instances = sample_alignment_instances(data, num_hops, batch_graphs,
+                                               tasks=alignment_tasks)
 
         # generator step: f_g maximizes L_SAKA to probe unaligned regions
         surrogate.eval()

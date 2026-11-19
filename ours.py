@@ -38,7 +38,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data, Batch
-from torch_geometric.utils import subgraph, k_hop_subgraph, negative_sampling
+from torch_geometric.utils import negative_sampling
 
 from model import (GCN, GAT, GIN, RGCN, NodeClassifier, GraphClassifier,
                    BlackBoxGNN, GAGGenerator, train_saka)
@@ -48,6 +48,8 @@ from utils.pasp import (stability_scores, select_stable_region,
                         distribution_drift)
 from utils.attacks import apply_attack
 from data.tag_data import load_tag, mix_tag_datasets, TAG_DATASETS
+from data.graph_instances import (require_original_graphs, original_graph,
+                                 sample_original_graphs, copy_graph_annotations)
 from evaluation.metrics import s_at_k, reconstruction_analysis
 
 
@@ -96,6 +98,11 @@ parser.add_argument('--mix_ratio', type=float, default=0.8,
                          '(0.8 / 0.6 / 0.4 / 0.2 in Tables 2-3).')
 parser.add_argument('--data_root', type=str, default='data/TAG',
                     help='Root of the prepared TAG datasets.')
+parser.add_argument('--tasks', nargs='+', choices=['node', 'edge', 'graph'],
+                    default=['node', 'edge', 'graph'],
+                    help='Verification tasks. The graph task requires original '
+                         'graph labels in graph_instances.pt; node is required '
+                         'for regional fingerprint construction.')
 parser.add_argument('--train_lr', type=float, default=0.01,
                     help='Learning rate for training the suspected GNN.')
 parser.add_argument('--weight_decay', type=float, default=5e-4,
@@ -171,7 +178,7 @@ parser.add_argument('--inner_prune', type=float, default=0.01,
                     help='Inner-edge pruning threshold of the prompt graph.')
 
 # verification settings
-parser.add_argument('--theta', type=int, default=2,
+parser.add_argument('--theta', type=int, default=None,
                     help='Evidence threshold theta in the multi-source '
                          'setting (majority voting: theta=2 for |T|=3).')
 
@@ -200,6 +207,13 @@ parser.add_argument('--recon_analysis', action='store_true',
 parser.add_argument('--device_id', type=int, default=0, help='GPU id.')
 
 args = parser.parse_known_args()[0]
+TASKS = tuple(dict.fromkeys(args.tasks))
+if 'node' not in TASKS:
+    parser.error('--tasks must include node for regional surrogate predictions')
+if args.theta is None:
+    args.theta = len(TASKS) // 2 + 1
+if not 1 <= args.theta <= len(TASKS):
+    parser.error('--theta must be between 1 and the number of selected tasks')
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 device = torch.device(
     ('cuda:{}' if args.cuda else 'cpu').format(args.device_id))
@@ -215,12 +229,18 @@ log = logging.info
 # Data: protected TAG dataset, optionally mixed with a second source
 # ---------------------------------------------------------------------------
 data = load_tag(args.dataset, root=args.data_root, seed=args.seed)
+if 'graph' in TASKS:
+    require_original_graphs(data)
 if args.mix_dataset is not None:
     other = load_tag(args.mix_dataset, root=args.data_root, seed=args.seed)
-    data = mix_tag_datasets(data, other, args.mix_ratio, seed=args.seed)
+    data = mix_tag_datasets(data, other, args.mix_ratio, seed=args.seed,
+                            preserve_graphs='graph' in TASKS)
     log(f"[Data] mixed {args.dataset}/{args.mix_dataset} "
         f"({args.mix_ratio:.0%}/{1 - args.mix_ratio:.0%}), "
         f"{data.num_classes} classes")
+    if 'graph' in TASKS:
+        log('[Data] graph-task mixture samples whole original graphs; '
+            'the mixture ratio applies to graph counts, not node counts')
 data = data.to(device)
 num_classes = data.num_classes
 raw_texts = data.raw_texts
@@ -228,8 +248,9 @@ owner_mask = getattr(data, 'owner_mask', None)
 llm_mode = args.llm_mode or ('multi' if args.mix_dataset else 'single')
 
 GNN_REGISTRY = {'GCN': GCN, 'GAT': GAT, 'GIN': GIN, 'RGCN': RGCN}
-TASKS = TaskUnifiedPrompt.TASKS
-TASK_CLASSES = {'node': num_classes, 'edge': 2, 'graph': num_classes}
+TASK_CLASSES = {'node': num_classes, 'edge': 2}
+if 'graph' in TASKS:
+    TASK_CLASSES['graph'] = data.graph_num_classes
 
 
 def build_gnn(name):
@@ -255,8 +276,12 @@ def build_heads():
 def sample_graph_batch(tau, source, num_instances):
     """Reformulated graph/subgraph classification instances (Sec. 4.3):
     node -> node-centered subgraph with the node label; edge -> endpoint-
-    centered subgraph with the link-existence label; graph -> a larger
-    subgraph with its majority label."""
+    centered subgraph with the link-existence label; graph -> the entire
+    original graph with its source-provided graph label."""
+    if tau == 'graph':
+        graphs = sample_original_graphs(source, num_instances)
+        batch = Batch.from_data_list(graphs).to(device)
+        return batch, batch.y.view(-1)
     train_idx = source.train_mask.nonzero(as_tuple=False).view(-1)
     graphs, labels = [], []
     for j in range(num_instances):
@@ -279,12 +304,7 @@ def sample_graph_batch(tau, source, num_instances):
             g = reformulate('edge', (u, v), source.x, source.edge_index,
                             args.num_hops)
         else:
-            v = int(train_idx[torch.randint(train_idx.numel(), (1,))].item())
-            subset, sub_ei, _, _ = k_hop_subgraph(
-                [v], args.num_hops + 1, source.edge_index,
-                relabel_nodes=True, num_nodes=source.num_nodes)
-            g = Data(x=source.x[subset], edge_index=sub_ei)
-            label = int(torch.bincount(source.y[subset]).argmax())
+            raise ValueError(f'Unknown training task: {tau}')
         graphs.append(g)
         labels.append(label)
     batch = Batch.from_data_list(graphs).to(device)
@@ -347,10 +367,24 @@ def make_independent_data(original):
     """A GNN trained on this shifted variant plays the innocent model that
     never used the protected TAG dataset."""
     perm = torch.randperm(original.num_nodes, device=device)
+    if 'graph' in TASKS:
+        # Preserve original graph boundaries when making this shifted control.
+        perm = torch.arange(original.num_nodes, device=device)
+        for graph_id in range(original.graph_y.numel()):
+            nodes = (original.graph_index == graph_id).nonzero(
+                as_tuple=False).view(-1)
+            perm[nodes] = nodes[torch.randperm(nodes.numel(), device=device)]
     x = original.x[perm]
     num_edges = original.edge_index.size(1)
     rewired = original.edge_index[:, torch.randperm(num_edges, device=device)]
     rewired = torch.stack([original.edge_index[0], rewired[1]], dim=0)
+    if 'graph' in TASKS:
+        rewired = original.edge_index.clone()
+        for graph_id in range(original.graph_y.numel()):
+            mask = original.graph_index[original.edge_index[0]] == graph_id
+            destinations = original.edge_index[1, mask]
+            rewired[1, mask] = destinations[torch.randperm(
+                destinations.numel(), device=device)]
     out = Data(x=x, edge_index=rewired, y=original.y,
                train_mask=original.train_mask,
                test_mask=original.test_mask).to(device)
@@ -361,7 +395,7 @@ def make_independent_data(original):
         out.val_mask = original.val_mask
     if hasattr(original, 'owner_mask'):
         out.owner_mask = original.owner_mask
-    return out
+    return copy_graph_annotations(original, out)
 
 
 # ---------------------------------------------------------------------------
@@ -427,13 +461,10 @@ fingerprint_nodes = select_fingerprint_nodes(
 log(f"[PASP] selected {fingerprint_nodes.numel()} fingerprint nodes with "
     f"pairwise disjoint stable regions (k={args.topk_stable})")
 
-regions, region_edge_indices, edge_partners = [], [], []
+regions, edge_partners = [], []
 for v in fingerprint_nodes.tolist():
     region = select_stable_region(v, scores, data.edge_index, args.topk_stable)
     regions.append(region)
-    region_ei, _ = subgraph(region, data.edge_index, relabel_nodes=True,
-                            num_nodes=data.num_nodes)
-    region_edge_indices.append(region_ei)
     if region.numel() > 1:
         partner = int(region[1])
     else:
@@ -444,12 +475,13 @@ for v in fingerprint_nodes.tolist():
 
 def task_instances(i, x_source):
     v = int(fingerprint_nodes[i])
-    return {
-        'node': v,
-        'edge': (v, edge_partners[i]),
-        'graph': Data(x=x_source[regions[i]],
-                      edge_index=region_edge_indices[i]),
-    }
+    instances = {'node': v}
+    if 'edge' in TASKS:
+        instances['edge'] = (v, edge_partners[i])
+    if 'graph' in TASKS:
+        instances['graph'] = original_graph(
+            data, int(data.graph_index[v]), x=x_source)
+    return instances
 
 
 tup = TaskUnifiedPrompt(token_dim=data.x.size(1),

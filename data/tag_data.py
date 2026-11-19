@@ -9,6 +9,8 @@ Each dataset is expected under ``<root>/<name>/`` with:
   - texts.jsonl   : one {"text": ...} (or {"title": ..., "abstract": ...})
                     record per node, the raw textual attributes X;
   - split.pt      : optional dict with train_mask / val_mask / test_mask.
+  - graph_instances.pt : original graph identities, class labels and graph
+                         splits; required when the graph task is requested.
 
 Use ``clean_data..py`` to prepare these files from raw TAG sources with a
 shared text encoder.
@@ -26,6 +28,8 @@ import os
 import torch
 from torch_geometric.data import Data
 from torch_geometric.utils import subgraph
+
+from .graph_instances import attach_original_graphs, require_original_graphs
 
 TAG_DATASETS = {
     'Cora-ML': 7,
@@ -87,17 +91,23 @@ def load_tag(name, root="data/TAG", seed=0):
     data.raw_texts = raw_texts
     data.num_classes = TAG_DATASETS[name]
     data.dataset_name = name
+    graph_path = os.path.join(folder, "graph_instances.pt")
+    if os.path.isfile(graph_path):
+        attach_original_graphs(data, torch.load(
+            graph_path, map_location="cpu", weights_only=True))
     return data
 
 
-def mix_tag_datasets(owner, other, owner_ratio, seed=0):
+def mix_tag_datasets(owner, other, owner_ratio, seed=0, preserve_graphs=False):
     """Single-source (same domain) or multi-source (different domains) mixture.
 
     Samples an ``owner_ratio`` fraction of the protected dataset and a
     ``1 - owner_ratio`` fraction of the other dataset, assigns disjoint class
     indices to the two sources, and takes their disjoint union. The returned
     ``owner_mask`` marks the protected source's nodes, from which fingerprint
-    targets are selected.
+    targets are selected. With ``preserve_graphs=True``, sampling fractions
+    apply to original graph counts, not nodes: whole original graphs are
+    retained and their graph-class labels use a separate source-wise offset.
     """
     if owner.x.size(1) != other.x.size(1):
         raise ValueError(
@@ -106,15 +116,25 @@ def mix_tag_datasets(owner, other, owner_ratio, seed=0):
     generator = torch.Generator().manual_seed(seed)
 
     def sample_source(data, ratio):
+        if preserve_graphs:
+            require_original_graphs(data)
+            count = data.graph_y.numel()
+            ids = torch.randperm(count, generator=generator)[
+                :max(1, int(ratio * count))].sort().values
+            idx = torch.isin(data.graph_index, ids).nonzero(
+                as_tuple=False).view(-1)
+            ei, _ = subgraph(idx, data.edge_index, relabel_nodes=True,
+                             num_nodes=data.num_nodes)
+            return idx, ei, ids
         n = max(1, int(ratio * data.num_nodes))
         idx = torch.randperm(data.num_nodes, generator=generator)[:n]
         idx = idx.sort().values
         ei, _ = subgraph(idx, data.edge_index, relabel_nodes=True,
                          num_nodes=data.num_nodes)
-        return idx, ei
+        return idx, ei, None
 
-    owner_idx, owner_ei = sample_source(owner, owner_ratio)
-    other_idx, other_ei = sample_source(other, 1.0 - owner_ratio)
+    owner_idx, owner_ei, owner_graphs = sample_source(owner, owner_ratio)
+    other_idx, other_ei, other_graphs = sample_source(other, 1.0 - owner_ratio)
     n_owner = owner_idx.numel()
 
     x = torch.cat([owner.x[owner_idx], other.x[other_idx]], dim=0)
@@ -128,7 +148,7 @@ def mix_tag_datasets(owner, other, owner_ratio, seed=0):
                             other.train_mask[other_idx]], dim=0)
     val_mask = torch.cat([owner.val_mask[owner_idx],
                           other.val_mask[other_idx]], dim=0)
-    test_mask = torch.cat([owner.test_mask[other_idx],
+    test_mask = torch.cat([owner.test_mask[owner_idx],
                            other.test_mask[other_idx]], dim=0)
 
     data = Data(x=x, edge_index=edge_index, y=y,
@@ -140,4 +160,21 @@ def mix_tag_datasets(owner, other, owner_ratio, seed=0):
         torch.zeros(other_idx.numel(), dtype=torch.bool)], dim=0)
     data.owner_num_classes = owner.num_classes
     data.dataset_name = f"{owner.dataset_name}/{other.dataset_name}"
+    if preserve_graphs:
+        graph_index = torch.cat([
+            torch.searchsorted(owner_graphs, owner.graph_index[owner_idx]),
+            torch.searchsorted(other_graphs, other.graph_index[other_idx])
+            + owner_graphs.numel()])
+        metadata = {
+            "graph_index": graph_index,
+            "labels": torch.cat([owner.graph_y[owner_graphs],
+                                 other.graph_y[other_graphs]
+                                 + owner.graph_num_classes]),
+            "num_classes": owner.graph_num_classes + other.graph_num_classes,
+        }
+        for split in ("train", "val", "test"):
+            metadata[split + "_mask"] = torch.cat([
+                getattr(owner, "graph_" + split + "_mask")[owner_graphs],
+                getattr(other, "graph_" + split + "_mask")[other_graphs]])
+        attach_original_graphs(data, metadata)
     return data
