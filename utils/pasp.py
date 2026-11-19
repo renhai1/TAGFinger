@@ -33,19 +33,27 @@ def select_stable_region(node, scores, edge_index, k):
     return torch.cat([center, neighbors])
 
 
-def select_fingerprint_nodes(scores, edge_index, num_nodes, total, k):
+def select_fingerprint_nodes(scores, edge_index, num_nodes, total, k,
+                             allowed_mask=None):
     """Greedily sample target nodes so that their stable regions are pairwise
-    disjoint (Appendix D), matching the independence condition of the
-    verification error bound (Proposition 5). Nodes are considered in
-    decreasing order of their stability scores.
+    disjoint. This avoids overlapping edits; it does not imply independence.
+    Non-finite scores and nodes outside the protected source are never used.
     """
     order = scores.argsort(descending=True)
     used = torch.zeros(num_nodes, dtype=torch.bool, device=scores.device)
     selected = []
+    if total <= 0 or k < 0:
+        raise ValueError("Fingerprint count must be positive and k nonnegative")
     for v in order.tolist():
+        if not bool(torch.isfinite(scores[v])):
+            continue
+        if allowed_mask is not None and not bool(allowed_mask[v]):
+            continue
         if used[v]:
             continue
         region = select_stable_region(v, scores, edge_index, k)
+        if allowed_mask is not None and not bool(allowed_mask[region].all()):
+            continue
         if used[region].any():
             continue
         selected.append(v)

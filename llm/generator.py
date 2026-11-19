@@ -8,10 +8,11 @@ generation: candidate edits are sampled, scored on the surrogate, and the
 best one is retained (Sec. 4.3).
 """
 
-import re
+from pathlib import Path
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from .output import parse_edits
 
 try:
     from .prompts import build_pasp_prompt, PERTURB_PROMPTS
@@ -19,32 +20,34 @@ except ImportError:
     from prompts import build_pasp_prompt, PERTURB_PROMPTS
 
 
-def parse_edits(output, target_node):
-    """Parse 'Node <id>: <edited text>' lines into {node_id: text}."""
-    edits = {}
-    for line in output.splitlines():
-        match = re.match(r"\s*Node\s+(\d+)\s*[:：]\s*(.+)", line)
-        if match:
-            edits[int(match.group(1))] = match.group(2).strip()
-    if not edits and output.strip():
-        edits[int(target_node)] = output.strip()
-    return edits
-
-
 class LLMPerturbator:
     def __init__(self, model_path, device="cuda"):
+        self.device = torch.device(device)
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path, trust_remote_code=True
         )
-        self.model = AutoModelForCausalLM.from_pretrained(
+        loader = AutoModelForCausalLM
+        if (Path(model_path) / "adapter_config.json").is_file():
+            from peft import AutoPeftModelForCausalLM
+            loader = AutoPeftModelForCausalLM
+        self.model = loader.from_pretrained(
             model_path,
-            device_map="auto",
+            device_map={"": str(self.device)},
+            torch_dtype=torch.float16 if self.device.type == "cuda" else torch.float32,
             trust_remote_code=True
         )
-        self.device = device
+        self.model.eval()
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        for param in self.model.parameters():
+            param.requires_grad_(False)
 
     @torch.no_grad()
     def _generate(self, prompt, max_new_tokens):
+        if self.tokenizer.chat_template:
+            prompt = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}], tokenize=False,
+                add_generation_prompt=True, enable_thinking=False)
         inputs = self.tokenizer(
             prompt, return_tensors="pt"
         ).to(self.model.device)
@@ -54,7 +57,8 @@ class LLMPerturbator:
             max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=0.8,
-            top_p=0.9
+            top_p=0.9,
+            pad_token_id=self.tokenizer.pad_token_id
         )
         return self.tokenizer.decode(
             outputs[0][inputs["input_ids"].size(1):], skip_special_tokens=True
@@ -73,10 +77,11 @@ class LLMPerturbator:
             node_id, target_text, neighbor_texts, structure, target_label,
             mode=mode)
         candidates = []
+        allowed = {int(node_id)} | {int(nid) for nid, _ in neighbor_texts}
         for _ in range(num_candidates):
             output = self._generate(prompt, max_new_tokens)
             edits = parse_edits(output, node_id)
-            if edits:
+            if edits and set(edits) <= allowed:
                 candidates.append(edits)
         return candidates
 

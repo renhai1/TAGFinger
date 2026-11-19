@@ -23,6 +23,20 @@ from torch_geometric.data import Data
 from torch_geometric.utils import k_hop_subgraph
 
 
+def remove_query_edge(edge_index, node_ids, query_edge):
+    """Remove both directions of the classified edge from an induced input."""
+    if query_edge is None:
+        return edge_index
+    u, v = query_edge
+    pu = (node_ids == int(u)).nonzero(as_tuple=False).view(-1)
+    pv = (node_ids == int(v)).nonzero(as_tuple=False).view(-1)
+    if pu.numel() != 1 or pv.numel() != 1:
+        raise ValueError("Edge endpoints must be present in the induced input")
+    keep = ~(((edge_index[0] == pu[0]) & (edge_index[1] == pv[0])) |
+             ((edge_index[0] == pv[0]) & (edge_index[1] == pu[0])))
+    return edge_index[:, keep]
+
+
 def reformulate(tau, instance, x, edge_index, num_hops=2):
     """Phi_tau: node -> G_v, edge (u, v) -> endpoint-centered subgraph,
     graph -> itself. Each task retains its own label semantics."""
@@ -30,7 +44,7 @@ def reformulate(tau, instance, x, edge_index, num_hops=2):
         subset, sub_edge_index, _, _ = k_hop_subgraph(
             [int(instance)], num_hops, edge_index,
             relabel_nodes=True, num_nodes=x.size(0))
-        return Data(x=x[subset], edge_index=sub_edge_index)
+        return Data(x=x[subset], edge_index=sub_edge_index, n_id=subset)
     if tau == 'edge':
         u, v = int(instance[0]), int(instance[1])
         subset, sub_edge_index, _, _ = k_hop_subgraph(
@@ -38,13 +52,8 @@ def reformulate(tau, instance, x, edge_index, num_hops=2):
             relabel_nodes=True, num_nodes=x.size(0))
         # the query edge itself is the classification target (link
         # existence), so it is excluded from the input subgraph
-        pos = {int(n): i for i, n in enumerate(subset.tolist())}
-        if u in pos and v in pos:
-            pu, pv = pos[u], pos[v]
-            keep = ~(((sub_edge_index[0] == pu) & (sub_edge_index[1] == pv)) |
-                     ((sub_edge_index[0] == pv) & (sub_edge_index[1] == pu)))
-            sub_edge_index = sub_edge_index[:, keep]
-        return Data(x=x[subset], edge_index=sub_edge_index)
+        sub_edge_index = remove_query_edge(sub_edge_index, subset, (u, v))
+        return Data(x=x[subset], edge_index=sub_edge_index, n_id=subset)
     if tau == 'graph':
         if not isinstance(instance, Data):
             raise ValueError("The graph task requires an explicit original graph instance")

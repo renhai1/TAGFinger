@@ -55,7 +55,7 @@ def _load_texts(path, num_nodes):
     return texts
 
 
-def load_tag(name, root="data/TAG", seed=0):
+def load_tag(name, root="data/TAG", seed=0, num_classes=None):
     if name not in TAG_DATASETS:
         raise ValueError(
             f"unsupported TAG dataset {name}; choose from {list(TAG_DATASETS)}")
@@ -67,6 +67,16 @@ def load_tag(name, root="data/TAG", seed=0):
     y = torch.load(os.path.join(folder, "labels.pt"), map_location="cpu",
                    weights_only=True)
     raw_texts = _load_texts(os.path.join(folder, "texts.jsonl"), x.size(0))
+    classes = TAG_DATASETS[name] if num_classes is None else num_classes
+    if (x.ndim != 2 or x.size(0) == 0 or not bool(torch.isfinite(x).all())
+            or y.dtype != torch.long or y.ndim != 1 or y.numel() != x.size(0)):
+        raise ValueError("Prepared features and node labels have invalid shapes/dtypes")
+    if (classes < 2 or bool((y < 0).any()) or bool((y >= classes).any())):
+        raise ValueError("Node labels are outside the declared task class space")
+    if (edge_index.dtype != torch.long or edge_index.ndim != 2
+            or edge_index.size(0) != 2 or (edge_index.numel() and
+            (int(edge_index.min()) < 0 or int(edge_index.max()) >= x.size(0)))):
+        raise ValueError("Prepared edge_index has invalid shape or node IDs")
 
     split_path = os.path.join(folder, "split.pt")
     if os.path.exists(split_path):
@@ -86,10 +96,17 @@ def load_tag(name, root="data/TAG", seed=0):
         val_mask[perm[n_train:n_train + n_val]] = True
         test_mask[perm[n_train + n_val:]] = True
 
+    masks = (train_mask, val_mask, test_mask)
+    if any(m.dtype != torch.bool or m.ndim != 1 or m.numel() != x.size(0) for m in masks):
+        raise ValueError("Node split masks must contain one boolean per node")
+    if bool((sum(m.long() for m in masks) != 1).any()):
+        raise ValueError("Node train/val/test splits must be disjoint and complete")
+    if not bool(train_mask.any()) or not bool(val_mask.any()):
+        raise ValueError("Nonempty training and validation splits are required")
     data = Data(x=x, edge_index=edge_index, y=y,
                 train_mask=train_mask, val_mask=val_mask, test_mask=test_mask)
     data.raw_texts = raw_texts
-    data.num_classes = TAG_DATASETS[name]
+    data.num_classes = classes
     data.dataset_name = name
     graph_path = os.path.join(folder, "graph_instances.pt")
     if os.path.isfile(graph_path):
@@ -114,6 +131,8 @@ def mix_tag_datasets(owner, other, owner_ratio, seed=0, preserve_graphs=False):
             "mixed sources must be encoded with the same language model so "
             "that node features have the same dimension")
     generator = torch.Generator().manual_seed(seed)
+    if not 0 < owner_ratio < 1:
+        raise ValueError("Mixture ratio must be strictly between zero and one")
 
     def sample_source(data, ratio):
         if preserve_graphs:

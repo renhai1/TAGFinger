@@ -28,6 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.utils import k_hop_subgraph, subgraph
 from data.graph_instances import original_graph_nodes, require_original_graphs
+from prompt.TUP import remove_query_edge
 
 
 class BlackBoxGNN:
@@ -74,25 +75,44 @@ class GAGGenerator(nn.Module):
             nn.Linear(2 * feat_dim, hid_dim), nn.ReLU(), nn.Linear(hid_dim, 1)
         )
 
-    def forward(self, x, edge_index):
+    def forward(self, x, edge_index, graph_index=None):
         delta_x = self.x_budget * torch.tanh(self.attr_mlp(x))
         x_tilde = x + delta_x
 
         num_nodes = x.size(0)
-        num_cand = max(1, int(self.edge_budget * edge_index.size(1)))
+        # edge_budget counts added COO entries, including both directions.
+        max_pairs = int(self.edge_budget * edge_index.size(1)) // 2
+        if max_pairs <= 0 or num_nodes < 2:
+            return x_tilde, edge_index
+        num_cand = max_pairs * 4
         src = torch.randint(0, num_nodes, (num_cand,), device=x.device)
         dst = torch.randint(0, num_nodes, (num_cand,), device=x.device)
+        valid = src != dst
+        if graph_index is not None:
+            valid &= graph_index[src] == graph_index[dst]
+        lo, hi = torch.minimum(src, dst), torch.maximum(src, dst)
+        pair_ids = torch.unique((lo * num_nodes + hi)[valid])
+        old_ids = torch.unique(torch.minimum(edge_index[0], edge_index[1])
+                               * num_nodes + torch.maximum(edge_index[0], edge_index[1]))
+        pair_ids = pair_ids[~torch.isin(pair_ids, old_ids)]
+        if pair_ids.numel() == 0:
+            return x_tilde, edge_index
+        src, dst = pair_ids // num_nodes, pair_ids % num_nodes
         scores = torch.sigmoid(
             self.edge_mlp(torch.cat([x[src], x[dst]], dim=1))
         ).squeeze(-1)
-        keep = scores > 0.5
+        keep = (scores > 0.5).nonzero(as_tuple=False).view(-1)[:max_pairs]
         edge_index_tilde = edge_index
-        if keep.any():
+        if keep.numel():
             new_src, new_dst = src[keep], dst[keep]
             # score-weighted feature relay: lets gradients of the structural
             # perturbation dA reach edge_mlp although added edges are discrete
             relay = scores[keep].unsqueeze(1) * self.x_budget * x_tilde[new_src].detach()
             x_tilde = x_tilde.index_add(0, new_dst, relay)
+            # Relay is only a surrogate gradient signal; the discrete edge
+            # selection itself is not differentiable. Bound the final feature
+            # change, including relay, by the declared coordinate-wise budget.
+            x_tilde = x + (x_tilde - x).clamp(-self.x_budget, self.x_budget)
             delta_a = torch.stack(
                 [torch.cat([new_src, new_dst]), torch.cat([new_dst, new_src])], dim=0
             )
@@ -112,7 +132,8 @@ def dvc_loss(p_sur_tilde, p_sur, p_sus_tilde, p_sus):
 
 
 def sample_alignment_instances(data, num_hops, num_instances,
-                               tasks=('node', 'edge', 'graph')):
+                               tasks=('node', 'edge', 'graph'),
+                               node_pool=None, graph_pool=None):
     """Task instances for graph-level alignment: node-centered subgraphs,
     endpoint-centered subgraphs, and entire original graph instances."""
     num_nodes = data.num_nodes
@@ -121,27 +142,44 @@ def sample_alignment_instances(data, num_hops, num_instances,
         return instances
     if 'graph' in tasks:
         require_original_graphs(data)
+    node_pool = (torch.arange(num_nodes, device=data.x.device)
+                 if node_pool is None else node_pool)
+    if node_pool.numel() == 0:
+        raise ValueError("Alignment node pool is empty")
+    in_pool = torch.zeros(num_nodes, dtype=torch.bool, device=data.x.device)
+    in_pool[node_pool] = True
+    allowed_edges = (in_pool[data.edge_index[0]] & in_pool[data.edge_index[1]]
+                     & (data.edge_index[0] != data.edge_index[1]))
+    edge_ids = allowed_edges.nonzero(as_tuple=False).view(-1)
     for j in range(num_instances):
         tau = tasks[j % len(tasks)]
+        query_edge = None
         if tau == 'graph':
-            node = int(torch.randint(num_nodes, (1,)).item())
-            subset = original_graph_nodes(data, int(data.graph_index[node]))
+            ids = (torch.unique(data.graph_index) if graph_pool is None else graph_pool)
+            if not ids.numel():
+                raise ValueError("Alignment graph pool is empty")
+            graph_id = int(ids[torch.randint(ids.numel(), (1,), device=ids.device)].item())
+            subset = original_graph_nodes(data, graph_id)
             sub_ei, _ = subgraph(subset, data.edge_index, relabel_nodes=True,
                                  num_nodes=num_nodes)
-            instances.append((tau, subset, sub_ei))
+            instances.append((tau, subset, sub_ei, None))
             continue
-        if tau == 'edge' and data.edge_index.size(1) > 0:
-            e = int(torch.randint(data.edge_index.size(1), (1,)).item())
+        if tau == 'edge':
+            if not edge_ids.numel():
+                continue  # Do not fabricate an edge or a different task.
+            e = int(edge_ids[torch.randint(edge_ids.numel(), (1,), device=edge_ids.device)].item())
             centers = data.edge_index[:, e].tolist()
+            query_edge = tuple(centers)
             hops = num_hops
         else:
-            tau = 'node' if tau == 'edge' else tau
-            centers = [int(torch.randint(num_nodes, (1,)).item())]
+            centers = [int(node_pool[torch.randint(node_pool.numel(), (1,),
+                                                  device=node_pool.device)].item())]
             hops = num_hops
         subset, sub_ei, _, _ = k_hop_subgraph(
             centers, hops, data.edge_index,
             relabel_nodes=True, num_nodes=num_nodes)
-        instances.append((tau, subset, sub_ei))
+        sub_ei = remove_query_edge(sub_ei, subset, query_edge)
+        instances.append((tau, subset, sub_ei, query_edge))
     return instances
 
 
@@ -157,9 +195,12 @@ def train_saka(surrogate, classifier, generator, blackbox, data,
     """
     graph_heads = graph_heads if graph_heads is not None else {}
     alignment_tasks = tuple(graph_heads)
+    if not use_dac and not use_dvc:
+        raise ValueError("SAKA needs at least one of DAC or DVC")
     sur_params = list(surrogate.parameters()) + list(classifier.parameters())
     for head in graph_heads.values():
         sur_params += list(head.parameters())
+    sur_params = list({id(p): p for p in sur_params}.values())
     sur_opt = torch.optim.Adam(sur_params, lr=lr, weight_decay=weight_decay)
     gen_opt = torch.optim.Adam(generator.parameters(), lr=lr)
 
@@ -172,30 +213,36 @@ def train_saka(surrogate, classifier, generator, blackbox, data,
         return F.softmax(logits, dim=1).squeeze(0)
 
     def alignment_loss(x_tilde, ei_tilde, nodes, instances, clean_grad):
-        p_sus_tilde = blackbox.query(x_tilde.detach(), ei_tilde)
-        p_sur_tilde = sur_node_probs(x_tilde, ei_tilde)
-        if clean_grad:
-            p_sur_clean = sur_node_probs(data.x, data.edge_index)
-        else:
-            with torch.no_grad():
+        if graph_heads and not instances:
+            raise ValueError("No valid task instances in this alignment batch")
+        node_loss = 0.0 * x_tilde.sum()
+        if not graph_heads:
+            # Legacy node-posterior interface only. The task-unified runner
+            # supplies graph heads and uses query_graph exclusively below.
+            p_sus_clean = blackbox.query(data.x, data.edge_index)
+            p_sus_tilde = blackbox.query(x_tilde.detach(), ei_tilde)
+            p_sur_tilde = sur_node_probs(x_tilde, ei_tilde)
+            if clean_grad:
                 p_sur_clean = sur_node_probs(data.x, data.edge_index)
-        # zero-valued tensor terms keep the graph connected when both
-        # constrainers are disabled in the ablation (Table 5)
-        node_loss = 0.0 * p_sur_tilde.sum()
-        if use_dac:
-            node_loss = node_loss + dac_loss(p_sur_tilde[nodes], p_sus_tilde[nodes])
-        if use_dvc:
-            node_loss = node_loss + dvc_loss(p_sur_tilde[nodes], p_sur_clean[nodes],
-                                             p_sus_tilde[nodes], p_sus_clean[nodes])
+            else:
+                with torch.no_grad():
+                    p_sur_clean = sur_node_probs(data.x, data.edge_index)
+            node_loss = 0.0 * p_sur_tilde.sum()
+            if use_dac:
+                node_loss = node_loss + dac_loss(p_sur_tilde[nodes], p_sus_tilde[nodes])
+            if use_dvc:
+                node_loss = node_loss + dvc_loss(p_sur_tilde[nodes], p_sur_clean[nodes],
+                                                 p_sus_tilde[nodes], p_sus_clean[nodes])
         # the same objectives on graph-level posteriors (C_tau classes)
         graph_loss = 0.0
         num_valid = 0
-        for tau, subset, sub_ei in instances:
+        for tau, subset, sub_ei, query_edge in instances:
             if tau not in graph_heads:
                 continue
             sub_x_t = x_tilde[subset]
             sub_ei_t, _ = subgraph(subset, ei_tilde, relabel_nodes=True,
                                    num_nodes=data.num_nodes)
+            sub_ei_t = remove_query_edge(sub_ei_t, subset, query_edge)
             q_sus_t = blackbox.query_graph(sub_x_t.detach(), sub_ei_t, tau)
             q_sur_t = sur_graph_probs(sub_x_t, sub_ei_t, tau)
             sub_x_c = data.x[subset]
@@ -219,19 +266,39 @@ def train_saka(surrogate, classifier, generator, blackbox, data,
             return node_loss + graph_loss / num_valid
         return node_loss
 
-    # fixed held-out batches for early stopping
-    val_nodes = torch.randperm(data.num_nodes)[:batch_nodes]
+    # Centers and original graph IDs are held out, not randomly relabeled
+    # training samples. Message passing may still use transductive context.
+    train_mask, val_mask = data.train_mask.clone(), data.val_mask.clone()
+    if 'graph' in alignment_tasks:
+        require_original_graphs(data)
+        train_mask &= data.graph_train_mask[data.graph_index]
+        val_mask &= data.graph_val_mask[data.graph_index]
+    train_pool = train_mask.nonzero(as_tuple=False).view(-1)
+    val_pool = val_mask.nonzero(as_tuple=False).view(-1)
+    if not train_pool.numel() or not val_pool.numel():
+        raise ValueError("SAKA requires nonempty disjoint train/val node splits")
+    if bool((data.train_mask & data.val_mask).any()):
+        raise ValueError("SAKA train and validation centers must be disjoint")
+    train_graphs = val_graphs = None
+    if 'graph' in alignment_tasks:
+        train_graphs = data.graph_train_mask.nonzero(as_tuple=False).view(-1)
+        val_graphs = data.graph_val_mask.nonzero(as_tuple=False).view(-1)
+        if not train_graphs.numel() or not val_graphs.numel():
+            raise ValueError("Graph alignment requires original train/val graphs")
+    val_nodes = val_pool[:batch_nodes]
     val_instances = sample_alignment_instances(data, num_hops, batch_graphs,
-                                               tasks=alignment_tasks)
+                                               tasks=alignment_tasks,
+                                               node_pool=val_pool, graph_pool=val_graphs)
 
     best_val = float('inf')
     best_state = None
     stale = 0
 
     for epoch in range(1, epochs + 1):
-        nodes = torch.randperm(data.num_nodes)[:batch_nodes]
+        nodes = train_pool[torch.randperm(train_pool.numel(), device=train_pool.device)[:batch_nodes]]
         instances = sample_alignment_instances(data, num_hops, batch_graphs,
-                                               tasks=alignment_tasks)
+                                               tasks=alignment_tasks,
+                                               node_pool=train_pool, graph_pool=train_graphs)
 
         # generator step: f_g maximizes L_SAKA to probe unaligned regions
         surrogate.eval()
@@ -240,7 +307,8 @@ def train_saka(surrogate, classifier, generator, blackbox, data,
             head.eval()
         generator.train()
         gen_opt.zero_grad()
-        x_tilde, ei_tilde = generator(data.x, data.edge_index)
+        x_tilde, ei_tilde = generator(data.x, data.edge_index,
+                                      getattr(data, 'graph_index', None))
         loss_gen = alignment_loss(x_tilde, ei_tilde, nodes, instances,
                                   clean_grad=False)
         (-loss_gen).backward()
@@ -254,7 +322,8 @@ def train_saka(surrogate, classifier, generator, blackbox, data,
         generator.eval()
         sur_opt.zero_grad()
         with torch.no_grad():
-            x_tilde, ei_tilde = generator(data.x, data.edge_index)
+            x_tilde, ei_tilde = generator(data.x, data.edge_index,
+                                          getattr(data, 'graph_index', None))
         loss_sur = alignment_loss(x_tilde, ei_tilde, nodes, instances,
                                   clean_grad=True)
         loss_sur.backward()
@@ -263,9 +332,12 @@ def train_saka(surrogate, classifier, generator, blackbox, data,
         # early stopping on the validation alignment loss
         surrogate.eval()
         classifier.eval()
+        for head in graph_heads.values():
+            head.eval()
         generator.eval()
         with torch.no_grad():
-            x_val, ei_val = generator(data.x, data.edge_index)
+            x_val, ei_val = generator(data.x, data.edge_index,
+                                      getattr(data, 'graph_index', None))
             val_loss = alignment_loss(x_val, ei_val, val_nodes, val_instances,
                                       clean_grad=False).item()
         if val_loss < best_val - 1e-6:

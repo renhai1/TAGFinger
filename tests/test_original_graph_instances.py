@@ -9,9 +9,11 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 HAS_TENSORS = (importlib.util.find_spec("torch") is not None
                and importlib.util.find_spec("torch_geometric") is not None)
 
@@ -24,6 +26,9 @@ def function_node(path, name):
 
 def load_function(path, name, namespace):
     node = function_node(path, name)
+    # Test functions in isolation without importing the experiment runner.
+    node.body = [statement for statement in node.body
+                 if not isinstance(statement, (ast.Import, ast.ImportFrom))]
     module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
     exec(compile(module, str(ROOT / path), "exec"), namespace)
     return namespace[name]
@@ -46,29 +51,27 @@ class SourceWiringTests(unittest.TestCase):
         self.assertNotIn("num_hops + 1", source)
 
     def test_verification_uses_full_graph_not_stable_region(self):
-        function = load_function("ours.py", "task_instances", {
-            "TASKS": ("node", "edge", "graph"),
-            "fingerprint_nodes": [3], "edge_partners": [4],
-            "data": SimpleNamespace(graph_index=[0, 0, 0, 1, 1]),
+        function = load_function("utils/audit.py", "make_task_instances", {
             "original_graph": lambda source, graph_id, x: (graph_id, x),
         })
+        source = SimpleNamespace(graph_index=[0, 0, 0, 1, 1])
         clean, edited = object(), object()
-        self.assertEqual(function(0, clean)["graph"], (1, clean))
-        self.assertEqual(function(0, edited)["graph"], (1, edited))
-        self.assertEqual(function(0, clean)["node"], 3)
-        self.assertEqual(function(0, clean)["edge"], (3, 4))
+        def query(x):
+            return function(source, ("node", "edge", "graph"), 3, 4, x)
+        self.assertEqual(query(clean)["graph"], (1, clean))
+        self.assertEqual(query(edited)["graph"], (1, edited))
+        self.assertEqual(query(clean)["node"], 3)
+        self.assertEqual(query(clean)["edge"], (3, 4))
 
     def test_node_edge_mode_does_not_require_graph_annotations(self):
-        function = load_function("ours.py", "task_instances", {
-            "TASKS": ("node", "edge"),
-            "fingerprint_nodes": [3], "edge_partners": [4],
-        })
-        self.assertEqual(function(0, object()), {"node": 3, "edge": (3, 4)})
+        function = load_function("utils/audit.py", "make_task_instances", {})
+        self.assertEqual(function(object(), ("node", "edge"), 3, 4, object()),
+                         {"node": 3, "edge": (3, 4)})
 
     def test_graph_class_count_is_not_node_class_count(self):
         source = (ROOT / "ours.py").read_text()
-        self.assertIn("TASK_CLASSES['graph'] = data.graph_num_classes", source)
-        self.assertNotIn("'graph': num_classes", source)
+        self.assertIn("classes['graph'] = source.graph_num_classes", source)
+        self.assertNotIn("'graph': source.num_classes", source)
 
     def test_alignment_does_not_crop_original_graphs(self):
         source = ast.unparse(function_node("model/SAKA.py",
@@ -144,9 +147,10 @@ class TensorGraphTests(unittest.TestCase):
         source = self.attached()
         sample = load_function("ours.py", "sample_graph_batch", {
             "sample_original_graphs": self.graphs.sample_original_graphs,
-            "Batch": Batch, "device": torch.device("cpu"),
+            "Batch": Batch,
         })
-        batch, labels = sample("graph", source, 2)
+        batch, labels = sample("graph", source, 2, SimpleNamespace(tasks=("graph",)),
+                               torch.device("cpu"))
         self.assertEqual(labels.tolist(), [2, 2])
         self.assertEqual(batch.num_graphs, 2)
         self.assertEqual(batch.num_nodes, 6)
@@ -158,8 +162,9 @@ class TensorGraphTests(unittest.TestCase):
             "k_hop_subgraph": k_hop_subgraph,
             "require_original_graphs": self.graphs.require_original_graphs,
             "original_graph_nodes": self.graphs.original_graph_nodes,
+            "remove_query_edge": self.tup.remove_query_edge,
         })
-        for tau, nodes, edges in sample(source, 0, 12, tasks=("graph",)):
+        for tau, nodes, edges, _ in sample(source, 0, 12, tasks=("graph",)):
             graph_id = int(source.graph_index[nodes[0]])
             expected = self.graphs.original_graph(source, graph_id)
             self.assertEqual(tau, "graph")
