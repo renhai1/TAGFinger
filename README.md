@@ -49,10 +49,14 @@ TAGFinger consists of three main components:
 ## 🎬 Video Overview
 
 <p align="center">
-  <img src="images/overview.gif" alt="TAGFinger 3-minute overview (preview)">
+  <a href="images/TAGFinger_Overview_v2.mp4">
+    <img src="images/overview_v2.gif" alt="TAGFinger: local text edits, cross-task responses, and ownership evidence">
+  </a>
 </p>
 
-> The full 3-minute narrated video is available at [`images/TAGFinger_Overview.mp4`](images/TAGFinger_Overview.mp4).
+> Watch the new **3-minute 22-second narrated overview**: [`images/TAGFinger_Overview_v2.mp4`](images/TAGFinger_Overview_v2.mp4).
+> Method animations and probability responses are explicitly schematic. Result panels cite specific settings from main-paper Tables 1, 3, and 4.
+> [Local preview page](video/preview.html) · [Captions and editable video source](video/README.md).
 
 ---
 

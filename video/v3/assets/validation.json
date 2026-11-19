@@ -1,0 +1,20 @@
+{
+  "purpose": "Visual-direction sample, not the completed supplementary film",
+  "duration_seconds": 55.328390022675734,
+  "size_bytes": 7328526,
+  "sha256": "c46613a6e1e623d7a601d8268b3a7a2c934add685901fb537d9c2fc7a31e6249",
+  "resolution": [
+    1920,
+    1080
+  ],
+  "internal_render_resolution": [
+    2560,
+    1440
+  ],
+  "fps": 30,
+  "audio": "48kHz AAC stereo",
+  "fast_start": true,
+  "full_decode_errors": "",
+  "illustrative_only": true,
+  "experimental_metrics_shown": false
+}

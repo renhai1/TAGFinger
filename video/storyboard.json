@@ -1,0 +1,137 @@
+{
+  "title": "TAGFinger — From graph data to ownership evidence",
+  "language": "en",
+  "voice": "en_US-ljspeech-high",
+  "disclaimer": "Method animations and probabilities are schematic, not a recorded experiment. Result panels reproduce specified entries from the submitted main paper; they are not a fresh code run.",
+  "scenes": [
+    {
+      "id": "question",
+      "chapter": "THE QUESTION",
+      "title": "Did this model use my graph data?",
+      "cues": [
+        "Your graph dataset took time to build. Did someone use it to train a model without permission?",
+        "TAG Finger investigates this question through black box queries, without accessing the model's training data or parameters."
+      ]
+    },
+    {
+      "id": "challenge",
+      "chapter": "THE CHALLENGE",
+      "title": "The training recipe is hidden.",
+      "cues": [
+        "The suspected model may mix your data with other sources, use another learning task, or change its architecture.",
+        "A fingerprint tied to one dataset and one task can become unreliable. We need evidence that travels."
+      ]
+    },
+    {
+      "id": "principle",
+      "chapter": "THE KEY IDEA",
+      "title": "Probe behavior. Do not plant a trigger.",
+      "cues": [
+        "TAG Finger leaves the released dataset unchanged. Local text edits are constructed on copies used for audit queries.",
+        "The edits act as fingerprints. Ownership evidence comes from the model's response to them, guided by semantics and structure."
+      ]
+    },
+    {
+      "id": "alignment",
+      "chapter": "01 / LEARN A QUERY-BASED PROXY",
+      "title": "Match predictions — and sensitivity.",
+      "cues": [
+        "First, sensitivity guided adversarial knowledge alignment trains a surrogate using the suspected model's output probabilities.",
+        "A generator exposes disagreements. The surrogate learns both the prediction distributions and their changes under perturbations.",
+        "The suspected model stays frozen. The surrogate becomes the workspace for fingerprint construction."
+      ]
+    },
+    {
+      "id": "region",
+      "chapter": "02 / FIND A RESILIENT REGION",
+      "title": "Keep the text in its graph context.",
+      "cues": [
+        "Next, the surrogate identifies a target node and its most predictively consistent neighbors.",
+        "These local regions anchor the text edits in graph structure, rather than editing isolated words everywhere."
+      ]
+    },
+    {
+      "id": "editing",
+      "chapter": "03 / CONSTRUCT A SEMANTIC FINGERPRINT",
+      "title": "Propose. Re-encode. Select.",
+      "cues": [
+        "A language model proposes text edits, conditioned on the region's text, its structure, and a target label.",
+        "The same text encoder re-encodes each candidate. The surrogate selects edits that strengthen target responses and regional drift.",
+        "Candidate selection alternates with prompt updates. No gradient passes through text generation; this stage does not query the suspected model."
+      ]
+    },
+    {
+      "id": "tasks",
+      "chapter": "04 / UNIFY THE QUERY FORMULATION",
+      "title": "Different tasks. One audit procedure.",
+      "cues": [
+        "Task unified prompts express node, edge, and graph instances as graph or subgraph classification inputs.",
+        "Each input receives a learned prompt graph. Task labels remain distinct; only the verification evidence is combined.",
+        "This assumes a compatible graph classification interface. It does not transform every arbitrary model API."
+      ]
+    },
+    {
+      "id": "evidence",
+      "chapter": "05 / READ THE BEHAVIORAL EVIDENCE",
+      "title": "A change toward the target is evidence.",
+      "cues": [
+        "Now query the suspected model on clean and edited inputs. Compare the predictions for each task.",
+        "A non-target prediction changing to the target gives positive evidence. An unchanged prediction gives zero evidence.",
+        "Here, two positive task responses meet the three-task majority threshold and support the dataset-use decision."
+      ]
+    },
+    {
+      "id": "uncertainty",
+      "chapter": "KEEP THE DECISION HONEST",
+      "title": "No change does not mean no use.",
+      "cues": [
+        "Changes toward another label give negative evidence. If neither side reaches the threshold, the result is uncertain.",
+        "One response is not a universal proof. Verification must also be evaluated against models trained without the protected data."
+      ]
+    },
+    {
+      "id": "results",
+      "chapter": "REPORTED EXPERIMENT / MAIN PAPER, TABLE 1",
+      "title": "Strong verification at a strict FPR budget.",
+      "cues": [
+        "For Cora M L with G C N on the node task, the paper reports ninety-five point four percent at S at one.",
+        "S at one is verification success rate under a false positive rate budget of one percent. These are paper results, not a new run."
+      ]
+    },
+    {
+      "id": "mixture",
+      "chapter": "REPORTED EXPERIMENT / MAIN PAPER, TABLES 3 & 4",
+      "title": "Evidence survives mixing and model changes.",
+      "cues": [
+        "With twenty percent Cora M L and eighty percent Reddit, Table three reports ninety-one point one percent at S at one.",
+        "For a G C N surrogate and a G A T suspected model on Reddit, Table four reports ninety-three point five percent."
+      ]
+    },
+    {
+      "id": "closing",
+      "chapter": "TAGFinger",
+      "title": "Audit the data. Read the evidence.",
+      "cues": [
+        "A query-based surrogate. Semantic fingerprints in stable graph regions. Task-wise evidence with an explicit uncertain outcome.",
+        "TAG Finger: semantic prompted, structural resilient fingerprinting for text attribute graph ownership verification."
+      ]
+    }
+  ],
+  "results": {
+    "table1": {
+      "source": "Main paper, Table 1, Cora-ML / GCN / node-level / S@1",
+      "methods": ["ZeroMark", "GNNFingers", "SIGFinger", "TAGFinger"],
+      "values": [63.1, 69.7, 71.8, 95.4]
+    },
+    "table3": {
+      "source": "Main paper, Table 3, Cora-ML / Reddit / node-level / S@1",
+      "owner_percentages": [80, 60, 40, 20],
+      "TAGFinger": [95.0, 94.4, 93.7, 91.1],
+      "SIGFinger": [46.5, 44.1, 42.6, 40.3]
+    },
+    "table4": {
+      "source": "Main paper, Table 4, surrogate GCN / suspected GAT / Reddit / S@1",
+      "value": 93.5
+    }
+  }
+}

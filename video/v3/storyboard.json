@@ -1,0 +1,32 @@
+{
+  "title": "TAGFinger — A behavioral signature in graph data",
+  "purpose": "Visual-direction and core-method sample, not a replacement for the complete submission video.",
+  "disclaimer": "All graph examples, text edits, probability shapes, and votes are schematic. No experimental performance value is shown.",
+  "voice": "en_US-ljspeech-high",
+  "shots": [
+    {
+      "id": "opening",
+      "cue": "Did this black box model train on your graph data?"
+    },
+    {
+      "id": "region",
+      "cue": "TAG Finger leaves the released dataset unchanged. On an audit copy, we focus on a local, predictively stable graph region."
+    },
+    {
+      "id": "edit",
+      "cue": "A language model proposes text edits. The same text encoder re-encodes them. A query-based surrogate selects edits that strengthen the target response and regional drift."
+    },
+    {
+      "id": "response",
+      "cue": "Now query the suspected model on clean and edited inputs. A change toward each task's target contributes positive evidence. Compatible tasks contribute separate votes."
+    },
+    {
+      "id": "verdict",
+      "cue": "Two positive votes meet the three-task majority threshold. Unchanged predictions contribute zero evidence, not a no-use verdict."
+    },
+    {
+      "id": "closing",
+      "cue": "TAG Finger. From graph semantics to ownership evidence."
+    }
+  ]
+}

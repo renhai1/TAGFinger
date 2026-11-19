@@ -1,0 +1,21 @@
+{
+  "file": "TAGFinger/images/TAGFinger_Overview_v2.mp4",
+  "bytes": 8686527,
+  "sha256": "fef80693ff882550a13363434105554ecf34220102a5da45aa6a1b182be3172e",
+  "duration_seconds": 201.79,
+  "resolution": [
+    1920,
+    1080
+  ],
+  "fps": 24,
+  "video_codec": "H.264 High / YUV420P",
+  "audio_codec": "AAC LC / 48000 Hz / mono",
+  "full_decode_errors": "",
+  "mp4_fast_start": true,
+  "preview_gif_seconds": 14.01,
+  "preview_gif_frames": 112,
+  "paper_values_validated": true,
+  "timeline_validated": true,
+  "preview_links_validated": true,
+  "notes": "Method examples are schematic. Empirical panels cite main-paper Tables 1, 3 and 4. Narration is synthesized."
+}

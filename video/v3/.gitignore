@@ -1,0 +1,4 @@
+__pycache__/
+assets/cue_*.wav
+assets/stills/
+assets/render.log
